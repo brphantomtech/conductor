@@ -1,0 +1,235 @@
+# golangci-lint configuration for Conductor.
+#
+# Two main jobs here:
+#   1. Run a sensible set of correctness/style linters.
+#   2. Enforce the architectural layering described in docs/architecture.md
+#      via depguard. Lower tiers MUST NOT import higher tiers.
+#
+# Tier order (lowest to highest):
+#   T0  internal/config, internal/db
+#   T1  internal/audit, internal/provider, internal/tracker, internal/workspace
+#   T2  internal/harness, internal/knowledge, internal/memory,
+#       internal/validation, internal/docstore
+#   T3  internal/router
+#   T4  internal/orchestrator
+#   T5  internal/api
+#   T6  cmd/
+
+run:
+  timeout: 5m
+  go: "1.23"
+  tests: true
+
+linters:
+  disable-all: true
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - revive
+    - depguard
+    - errorlint
+    - wrapcheck
+    - lll
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/conductor-sh/conductor
+
+  errorlint:
+    errorf: true        # require %w for wrapping
+    asserts: true
+    comparison: true
+
+  wrapcheck:
+    # Only require wrapping at module boundaries; internal-to-internal calls
+    # may return errors verbatim if they already carry enough context.
+    ignoreSigs:
+      - .Errorf(
+      - errors.New(
+      - errors.Join(
+      - errors.Unwrap(
+      - .Wrap(
+      - .Wrapf(
+
+  lll:
+    line-length: 120     # warn (not error) on overly-long lines
+
+  revive:
+    severity: warning
+    rules:
+      - name: var-naming
+      - name: package-comments
+      - name: exported
+      - name: receiver-naming
+      - name: error-strings
+      - name: error-return
+      - name: blank-imports
+      - name: dot-imports
+      - name: redefines-builtin-id
+
+  depguard:
+    rules:
+      # ---------------- Tier 0: foundation ----------------
+      tier-0-config:
+        list-mode: lax
+        files:
+          - "internal/config/**"
+        deny:
+          - pkg: github.com/conductor-sh/conductor/internal/db
+            desc: "config (T0) cannot import db (T0 sibling — config is below db's user)"
+          - pkg: github.com/conductor-sh/conductor/internal/audit
+          - pkg: github.com/conductor-sh/conductor/internal/provider
+          - pkg: github.com/conductor-sh/conductor/internal/tracker
+          - pkg: github.com/conductor-sh/conductor/internal/workspace
+          - pkg: github.com/conductor-sh/conductor/internal/harness
+          - pkg: github.com/conductor-sh/conductor/internal/knowledge
+          - pkg: github.com/conductor-sh/conductor/internal/memory
+          - pkg: github.com/conductor-sh/conductor/internal/validation
+          - pkg: github.com/conductor-sh/conductor/internal/docstore
+          - pkg: github.com/conductor-sh/conductor/internal/router
+          - pkg: github.com/conductor-sh/conductor/internal/orchestrator
+          - pkg: github.com/conductor-sh/conductor/internal/api
+
+      tier-0-db:
+        list-mode: lax
+        files:
+          - "internal/db/**"
+        deny:
+          - pkg: github.com/conductor-sh/conductor/internal/audit
+          - pkg: github.com/conductor-sh/conductor/internal/provider
+          - pkg: github.com/conductor-sh/conductor/internal/tracker
+          - pkg: github.com/conductor-sh/conductor/internal/workspace
+          - pkg: github.com/conductor-sh/conductor/internal/harness
+          - pkg: github.com/conductor-sh/conductor/internal/knowledge
+          - pkg: github.com/conductor-sh/conductor/internal/memory
+          - pkg: github.com/conductor-sh/conductor/internal/validation
+          - pkg: github.com/conductor-sh/conductor/internal/docstore
+          - pkg: github.com/conductor-sh/conductor/internal/router
+          - pkg: github.com/conductor-sh/conductor/internal/orchestrator
+          - pkg: github.com/conductor-sh/conductor/internal/api
+
+      # ---------------- Tier 1: external adapters & infra ----------------
+      # Audit is cross-cutting; siblings may not import each other but everyone
+      # may import audit. Provider/tracker/workspace are siblings — no
+      # cross-imports.
+      tier-1-provider:
+        list-mode: lax
+        files:
+          - "internal/provider/**"
+        deny:
+          - pkg: github.com/conductor-sh/conductor/internal/tracker
+          - pkg: github.com/conductor-sh/conductor/internal/workspace
+          - pkg: github.com/conductor-sh/conductor/internal/harness
+          - pkg: github.com/conductor-sh/conductor/internal/knowledge
+          - pkg: github.com/conductor-sh/conductor/internal/memory
+          - pkg: github.com/conductor-sh/conductor/internal/validation
+          - pkg: github.com/conductor-sh/conductor/internal/docstore
+          - pkg: github.com/conductor-sh/conductor/internal/router
+          - pkg: github.com/conductor-sh/conductor/internal/orchestrator
+          - pkg: github.com/conductor-sh/conductor/internal/api
+
+      tier-1-tracker:
+        list-mode: lax
+        files:
+          - "internal/tracker/**"
+        deny:
+          - pkg: github.com/conductor-sh/conductor/internal/provider
+          - pkg: github.com/conductor-sh/conductor/internal/workspace
+          - pkg: github.com/conductor-sh/conductor/internal/harness
+          - pkg: github.com/conductor-sh/conductor/internal/knowledge
+          - pkg: github.com/conductor-sh/conductor/internal/memory
+          - pkg: github.com/conductor-sh/conductor/internal/validation
+          - pkg: github.com/conductor-sh/conductor/internal/docstore
+          - pkg: github.com/conductor-sh/conductor/internal/router
+          - pkg: github.com/conductor-sh/conductor/internal/orchestrator
+          - pkg: github.com/conductor-sh/conductor/internal/api
+
+      tier-1-workspace:
+        list-mode: lax
+        files:
+          - "internal/workspace/**"
+        deny:
+          - pkg: github.com/conductor-sh/conductor/internal/provider
+          - pkg: github.com/conductor-sh/conductor/internal/tracker
+          - pkg: github.com/conductor-sh/conductor/internal/harness
+          - pkg: github.com/conductor-sh/conductor/internal/knowledge
+          - pkg: github.com/conductor-sh/conductor/internal/memory
+          - pkg: github.com/conductor-sh/conductor/internal/validation
+          - pkg: github.com/conductor-sh/conductor/internal/docstore
+          - pkg: github.com/conductor-sh/conductor/internal/router
+          - pkg: github.com/conductor-sh/conductor/internal/orchestrator
+          - pkg: github.com/conductor-sh/conductor/internal/api
+
+      tier-1-audit:
+        list-mode: lax
+        files:
+          - "internal/audit/**"
+        deny:
+          - pkg: github.com/conductor-sh/conductor/internal/provider
+          - pkg: github.com/conductor-sh/conductor/internal/tracker
+          - pkg: github.com/conductor-sh/conductor/internal/workspace
+          - pkg: github.com/conductor-sh/conductor/internal/harness
+          - pkg: github.com/conductor-sh/conductor/internal/knowledge
+          - pkg: github.com/conductor-sh/conductor/internal/memory
+          - pkg: github.com/conductor-sh/conductor/internal/validation
+          - pkg: github.com/conductor-sh/conductor/internal/docstore
+          - pkg: github.com/conductor-sh/conductor/internal/router
+          - pkg: github.com/conductor-sh/conductor/internal/orchestrator
+          - pkg: github.com/conductor-sh/conductor/internal/api
+
+      # ---------------- Tier 2: domain engines ----------------
+      # Engines may import all of T0+T1, but not each other and not T3+.
+      tier-2-engines:
+        list-mode: lax
+        files:
+          - "internal/harness/**"
+          - "internal/knowledge/**"
+          - "internal/memory/**"
+          - "internal/validation/**"
+          - "internal/docstore/**"
+        deny:
+          - pkg: github.com/conductor-sh/conductor/internal/router
+          - pkg: github.com/conductor-sh/conductor/internal/orchestrator
+          - pkg: github.com/conductor-sh/conductor/internal/api
+
+      # ---------------- Tier 3: router ----------------
+      tier-3-router:
+        list-mode: lax
+        files:
+          - "internal/router/**"
+        deny:
+          - pkg: github.com/conductor-sh/conductor/internal/orchestrator
+          - pkg: github.com/conductor-sh/conductor/internal/api
+
+      # ---------------- Tier 4: orchestrator ----------------
+      tier-4-orchestrator:
+        list-mode: lax
+        files:
+          - "internal/orchestrator/**"
+        deny:
+          - pkg: github.com/conductor-sh/conductor/internal/api
+
+      # cmd/ and internal/api have no upward imports possible.
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  exclude-rules:
+    # Test files don't need to wrap errors as strictly.
+    - path: _test\.go
+      linters:
+        - wrapcheck
+        - lll
+    # Generated code (none yet, but reserve the rule).
+    - path: \.gen\.go
+      linters:
+        - lll
+        - revive
+        - errcheck
