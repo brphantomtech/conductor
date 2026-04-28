@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(go env *)",
+      "Bash(go version *)",
+      "Bash(golangci-lint --version)",
+      "Bash(go install *)",
+      "Read(//c/Users/Edson/go/bin/**)",
+      "Bash(/c/Users/Edson/go/bin/golangci-lint --version)",
+      "Bash(git checkout *)",
+      "Bash(make test *)",
+      "Bash(go test *)",
+      "Bash(rm go.sum)",
+      "Bash(go mod *)",
+      "Bash(/c/Users/Edson/go/bin/golangci-lint run *)",
+      "Bash(go fmt *)",
+      "Bash(go build *)",
+      "Bash(go vet *)",
+      "Bash(go run *)"
+    ]
+  }
+}
