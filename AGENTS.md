@@ -38,6 +38,7 @@ Frontend (SvelteKit, embedded into Go binary via `embed`):
 - Implementation phases and ordering → [docs/phases.md](docs/phases.md)
 - Go conventions (naming, errors, interfaces) → [docs/conventions.md](docs/conventions.md)
 - Authoritative reference → [SPEC.md](SPEC.md)
-- Phase 1 atomic task list → [TASKS.md](TASKS.md)
+- Phase 1 + Phase 2 atomic task list → [TASKS.md](TASKS.md)
+- Phase 2 HARNESS.md loader (parser, validator, renderer, watcher) → [internal/harness/](internal/harness/)
 
 This file is a map. It contains no rules. Rules and rationale live in `docs/`.
