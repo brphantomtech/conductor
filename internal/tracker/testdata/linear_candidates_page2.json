@@ -1,0 +1,28 @@
+{
+  "data": {
+    "project": {
+      "issues": {
+        "pageInfo": {
+          "hasNextPage": false,
+          "endCursor": "cursor-3"
+        },
+        "nodes": [
+          {
+            "id": "issue-3",
+            "identifier": "ABC-3",
+            "title": "Fix typo in README",
+            "description": "",
+            "priority": 3,
+            "branchName": "abc-3-fix-typo",
+            "url": "https://linear.app/test/issue/ABC-3",
+            "createdAt": "2026-04-04T10:00:00Z",
+            "updatedAt": "2026-04-04T11:00:00Z",
+            "state": {"name": "Todo"},
+            "labels": {"nodes": [{"name": "docs"}]},
+            "blockedBy": {"edges": []}
+          }
+        ]
+      }
+    }
+  }
+}

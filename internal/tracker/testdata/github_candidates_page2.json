@@ -1,0 +1,25 @@
+[
+  {
+    "id": 1004,
+    "number": 4,
+    "title": "Improve docs",
+    "body": "Docs are stale",
+    "state": "open",
+    "html_url": "https://github.com/owner/repo/issues/4",
+    "created_at": "2026-04-05T10:00:00Z",
+    "updated_at": "2026-04-05T11:00:00Z",
+    "labels": [{"name": "docs"}, {"name": "enhancement"}],
+    "tracked_in_issues": [{"number": 1, "url": "https://api.github.com/repos/owner/repo/issues/1"}]
+  },
+  {
+    "id": 1005,
+    "number": 5,
+    "title": "Add tests",
+    "body": "",
+    "state": "open",
+    "html_url": "https://github.com/owner/repo/issues/5",
+    "created_at": "2026-04-06T10:00:00Z",
+    "updated_at": "2026-04-06T11:00:00Z",
+    "labels": []
+  }
+]

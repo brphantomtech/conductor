@@ -1,0 +1,11 @@
+{
+  "data": {
+    "issues": {
+      "nodes": [
+        {"id": "issue-1", "state": {"name": "Todo"}},
+        {"id": "issue-2", "state": {"name": "In Progress"}},
+        {"id": "issue-3", "state": {"name": "Done"}}
+      ]
+    }
+  }
+}
