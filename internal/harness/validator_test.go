@@ -7,6 +7,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/conductor-sh/conductor/internal/config"
+	"github.com/conductor-sh/conductor/internal/provider"
 )
 
 // validCfg returns a Config that passes Validate. Tests start from this
@@ -143,6 +144,37 @@ func TestValidate_TrackerNeedsProjectRef(t *testing.T) {
 	err := Validate(validDef(), cfg)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrTrackerProjectRefMissing))
+}
+
+// TestValidate_DelegatesToProviderValidate confirms that the harness
+// validator surfaces SPEC §23.3 sentinels through the joined error
+// alongside the existing harness sub-class sentinels — checks that a
+// `custom`-without-`base_url` configuration is flagged via
+// provider.ErrUnsupportedProvider even though it slips past the
+// harness-side provider rules.
+func TestValidate_DelegatesToProviderValidate(t *testing.T) {
+	cfg := validCfg()
+	cfg.Providers.Default.Provider = "custom"
+	cfg.Providers.Default.APIKey = "k"
+	cfg.Providers.Default.BaseURL = "" // required for custom
+
+	err := Validate(validDef(), cfg)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, provider.ErrUnsupportedProvider))
+	require.Contains(t, err.Error(), "base_url")
+}
+
+// TestValidate_ProviderRoleOverrideIsValidated confirms that a per-role
+// override missing an api_key is flagged via the SPEC §23.3 sentinel
+// the provider package surfaces.
+func TestValidate_ProviderRoleOverrideIsValidated(t *testing.T) {
+	cfg := validCfg()
+	cfg.Providers.Roles = map[string]config.ProviderConfig{
+		"coder": {Provider: "openai", Model: "x", APIKey: ""},
+	}
+	err := Validate(validDef(), cfg)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, provider.ErrMissingAPIKey))
 }
 
 func TestValidate_BadTemplateIsReported(t *testing.T) {
