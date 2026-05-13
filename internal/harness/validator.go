@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/conductor-sh/conductor/internal/config"
+	"github.com/conductor-sh/conductor/internal/provider"
 )
 
 // supportedTrackerKinds mirrors config.supportedTrackerKind. Duplicated
@@ -124,6 +125,16 @@ func Validate(def *Definition, cfg config.Config) error {
 			continue
 		}
 		errs = append(errs, fmt.Errorf("%w: docs.stores[%d].backend %q is not supported", ErrDocStoreBackendUnsupported, i, store.Backend))
+	}
+
+	// Delegate the SPEC §23.3 provider-block checks to the provider
+	// package — it owns the supported-kinds list, the loopback-loopback
+	// auth rules, the custom-requires-base_url rule, and the
+	// compaction_strategy enum. The harness sentinels above are kept so
+	// the existing CLI categorisation continues to work; this call
+	// supplements them with the SPEC §23.3 classifications.
+	if err := provider.Validate(cfg.Providers); err != nil {
+		errs = append(errs, err)
 	}
 
 	// Pipeline role → template coverage.
