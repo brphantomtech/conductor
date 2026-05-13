@@ -1,0 +1,38 @@
+{
+  "data": {
+    "project": {
+      "issues": {
+        "pageInfo": {
+          "hasNextPage": false,
+          "endCursor": null
+        },
+        "nodes": [
+          {
+            "id": "issue-2",
+            "identifier": "ABC-2",
+            "title": "Blocked issue",
+            "description": "",
+            "priority": 1,
+            "branchName": "abc-2-blocked",
+            "url": "https://linear.app/test/issue/ABC-2",
+            "createdAt": "2026-04-03T10:00:00Z",
+            "updatedAt": "2026-04-03T11:00:00Z",
+            "state": {"name": "Todo"},
+            "labels": {"nodes": [{"name": "bug"}]},
+            "blockedBy": {
+              "edges": [
+                {
+                  "node": {
+                    "id": "issue-99",
+                    "identifier": "ABC-99",
+                    "state": {"name": "In Review"}
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

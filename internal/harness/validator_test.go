@@ -8,6 +8,7 @@ import (
 
 	"github.com/conductor-sh/conductor/internal/config"
 	"github.com/conductor-sh/conductor/internal/provider"
+	"github.com/conductor-sh/conductor/internal/tracker"
 )
 
 // validCfg returns a Config that passes Validate. Tests start from this
@@ -162,6 +163,23 @@ func TestValidate_DelegatesToProviderValidate(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, provider.ErrUnsupportedProvider))
 	require.Contains(t, err.Error(), "base_url")
+}
+
+// TestValidate_DelegatesToTrackerValidate confirms that the harness
+// validator surfaces SPEC §23.2 sentinels through the joined error
+// alongside the existing harness sub-class sentinels. The harness's
+// own `supportedTrackerKinds` map covers the "redmine" case from
+// TestValidate_UnsupportedTrackerKindIsReported, but the SPEC §23.2
+// `tracker.ErrUnsupportedKind` sentinel only reaches the error chain
+// via the tracker.Validate delegation.
+func TestValidate_DelegatesToTrackerValidate(t *testing.T) {
+	cfg := validCfg()
+	cfg.Tracker.Kind = "made-up-tracker"
+
+	err := Validate(validDef(), cfg)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, tracker.ErrUnsupportedKind),
+		"joined error must surface tracker.ErrUnsupportedKind from delegation")
 }
 
 // TestValidate_ProviderRoleOverrideIsValidated confirms that a per-role

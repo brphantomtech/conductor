@@ -6,6 +6,7 @@ import (
 
 	"github.com/conductor-sh/conductor/internal/config"
 	"github.com/conductor-sh/conductor/internal/provider"
+	"github.com/conductor-sh/conductor/internal/tracker"
 )
 
 // supportedTrackerKinds mirrors config.supportedTrackerKind. Duplicated
@@ -134,6 +135,16 @@ func Validate(def *Definition, cfg config.Config) error {
 	// the existing CLI categorisation continues to work; this call
 	// supplements them with the SPEC §23.3 classifications.
 	if err := provider.Validate(cfg.Providers); err != nil {
+		errs = append(errs, err)
+	}
+
+	// Delegate the SPEC §23.2 tracker-block checks to the tracker
+	// package — it owns the supported-kinds list, the project_slug /
+	// project_id rules per kind, and the empty-active_states warning.
+	// The harness sentinels above (ErrTrackerKindMissing, etc.) are
+	// kept so the existing CLI categorisation continues to work; this
+	// call supplements them with the SPEC §23.2 classifications.
+	if err := tracker.Validate(cfg.Tracker); err != nil {
 		errs = append(errs, err)
 	}
 
