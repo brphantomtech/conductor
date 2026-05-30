@@ -1,0 +1,58 @@
+{
+  "data": {
+    "project": {
+      "issues": {
+        "pageInfo": {
+          "hasNextPage": true,
+          "endCursor": "cursor-2"
+        },
+        "nodes": [
+          {
+            "id": "issue-1",
+            "identifier": "ABC-1",
+            "title": "Add login form",
+            "description": "Implement login form on home page",
+            "priority": 2,
+            "branchName": "abc-1-add-login-form",
+            "url": "https://linear.app/test/issue/ABC-1",
+            "createdAt": "2026-04-01T10:00:00Z",
+            "updatedAt": "2026-04-02T11:00:00Z",
+            "state": {"name": "Todo"},
+            "labels": {
+              "nodes": [
+                {"name": "Bug"},
+                {"name": "FRONTEND"},
+                {"name": "bug"}
+              ]
+            },
+            "blockedBy": {"edges": []}
+          },
+          {
+            "id": "issue-2",
+            "identifier": "ABC-2",
+            "title": "Investigate slow query",
+            "description": null,
+            "priority": null,
+            "branchName": "",
+            "url": "https://linear.app/test/issue/ABC-2",
+            "createdAt": "2026-04-03T10:00:00Z",
+            "updatedAt": "2026-04-03T11:00:00Z",
+            "state": {"name": "In Progress"},
+            "labels": {"nodes": []},
+            "blockedBy": {
+              "edges": [
+                {
+                  "node": {
+                    "id": "issue-99",
+                    "identifier": "ABC-99",
+                    "state": {"name": "In Review"}
+                  }
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  }
+}

@@ -1,3 +1,10 @@
+# Atomic Tasks — Phase 1 and Phase 2
+
+This file is the per-phase atomic task list. Phase 1 sits at the top
+(historical record); Phase 2 follows below. Earlier phases are kept
+intact for traceability so reviewers can see how the deliverables map
+onto SPEC sections.
+
 # Phase 1 — Atomic Tasks
 
 Phase 1 goal (per [docs/phases.md](docs/phases.md)): produce a buildable Conductor binary
@@ -129,3 +136,37 @@ Coverage target for Phase 1: ≥ 70% across `internal/config`, `internal/db`, `i
 - Tracker adapters (Phase 4)
 - Workspaces, orchestrator, router, validation, memory, knowledge, docstore, harness enforcer,
   HTTP API, dashboard, container isolation, plugins (Phases 5–18 per [docs/phases.md](docs/phases.md))
+
+---
+
+# Phase 2 — Atomic Tasks
+
+Phase 2 goal (per [docs/phases.md](docs/phases.md)): parse, validate, and hot-reload
+`HARNESS.md`. Replace the Phase 1 stub `conductor harness validate` with the real
+implementation and wire front matter into `config.Load` so the precedence chain finally honors
+HARNESS.md values.
+
+| ID    | Title                                      | Spec section(s)   | Complexity | Depends on  |
+| ----- | ------------------------------------------ | ----------------- | ---------- | ----------- |
+| P2-01 | Add `osteele/liquid` + promote `fsnotify` to direct deps | §16.2, §6.3 | S | — |
+| P2-02 | Path discovery (flag → env → cwd → docstore stub) | §5.1 | S | — |
+| P2-03 | Front-matter + body parser (`Parse`/`parseBytes`) | §5.2 | M | — |
+| P2-04 | Strict Liquid renderer with §16.2 variables | §16.2 | M | P2-01 |
+| P2-05 | `Validate(def, cfg)` with `errors.Join` + sub-class sentinels | §5.3, §6.4 | M | P2-03 |
+| P2-06 | `Load(opts) (Result, error)` orchestrating Resolve → Parse → config.Load → Validate | §5, §6 | M | P2-02..P2-05 |
+| P2-07 | fsnotify-based `Watcher` with 250 ms debounce + last-known-good fallback | §6.3 | L | P2-06 |
+| P2-08 | Real `conductor harness validate` printing categorized errors | §19.1, §23.1 | M | P2-06 |
+| P2-09 | `conductor start` integrated with `harness.Load` + `Watcher` | §19.2, §5, §6.3 | M | P2-06, P2-07 |
+| P2-10 | Emit `ConfigReloaded` / `ConfigReloadFailed` audit events | §17.2 | S | P2-07 |
+| P2-11 | Phase-2 unit tests across `internal/harness/...` | n/a | M | P2-02..P2-10 |
+
+## Out of scope for Phase 2
+
+- Doc-store resolution of HARNESS.md (Phase 11; the discovery resolver leaves a stub branch
+  that returns `missing_harness_file`).
+- `HarnessRule.check` execution (Phase 12); front-matter shape for the `harness_rules` list
+  is parsed and preserved but no rule runner runs.
+- Pre-dispatch drift checks and the GC scheduler (Phase 12).
+- Per-turn prompt rendering inside a real run (Phase 7 router will wire the renderer).
+- Continuation-prompt section dispatch at runtime (parsed and stored, but unused until
+  Phase 7).

@@ -1,0 +1,7 @@
+{
+  "data": null,
+  "errors": [
+    {"message": "Argument 'projectId' has invalid value"},
+    {"message": "Cannot query field 'foo' on type 'Issue'"}
+  ]
+}

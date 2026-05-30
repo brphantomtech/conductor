@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sort"
+	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -49,6 +50,10 @@ func newHarnessValidateCommand() *cobra.Command {
 			"mock bindings. Exits non-zero when the parser, config decoder, or " +
 			"template validator reports an issue.",
 		Args: cobra.MaximumNArgs(1),
+		// runHarnessValidate emits its own categorized stderr output; we
+		// silence Cobra's default "Error: ..." line so each underlying
+		// problem is only printed once.
+		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			// A positional path overrides --harness; either then takes
 			// precedence over $CONDUCTOR_HARNESS_PATH and the cwd default

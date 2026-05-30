@@ -16,7 +16,8 @@
       "Bash(go fmt *)",
       "Bash(go build *)",
       "Bash(go vet *)",
-      "Bash(go run *)"
+      "Bash(go run *)",
+      "Bash(openspec instructions *)"
     ]
   }
 }

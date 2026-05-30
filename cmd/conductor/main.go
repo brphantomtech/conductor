@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -15,8 +16,15 @@ func main() {
 	defer stop()
 
 	root := cmd.NewRootCommand()
-	if err := root.ExecuteContext(ctx); err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+	err := root.ExecuteContext(ctx)
+	if err == nil {
+		return
 	}
+	// Subcommands that print their own categorized stderr return
+	// cmd.ErrSilent so we skip the default duplicated error line and
+	// just exit non-zero.
+	if !errors.Is(err, cmd.ErrSilent) {
+		fmt.Fprintln(os.Stderr, err)
+	}
+	os.Exit(1)
 }
