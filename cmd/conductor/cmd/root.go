@@ -1,9 +1,16 @@
 package cmd
 
 import (
+	"errors"
+
 	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 )
+
+// ErrSilent is returned (or wrapped) by subcommands that have already written
+// their own categorized error output to stderr. main() detects it with
+// errors.Is and exits non-zero without printing a duplicated error line.
+var ErrSilent = errors.New("conductor: command failed (already reported)")
 
 // rootFlags holds values bound to flags on the root command. They are
 // resolved in initLogger (PersistentPreRunE) so every subcommand sees the

@@ -2,7 +2,6 @@ package cmd
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sort"
 
@@ -58,54 +57,55 @@ func newStartCommand(rctx *rootContext) *cobra.Command {
 }
 
 func runStart(ctx context.Context, cmd *cobra.Command, rctx *rootContext, flags *startFlags) error {
-	res, err := harness.Load(harness.LoadOptions{
-		Flag:     flags.harness,
-		CLIFlags: cmd.Flags(),
-	})
-	if err != nil {
-		return fmt.Errorf("start: load config: %w", err)
-	}
-
 	// Resolve the HARNESS.md location per SPEC §5.1: --harness, then
 	// $CONDUCTOR_HARNESS_PATH, then the cwd default.
 	harnessPath := harness.ResolvePath(flags.harness, nil)
+	loadOpts := config.LoadOptions{Flags: cmd.Flags()}
+
+	res, loadErr := harness.Load(harnessPath, loadOpts)
+
+	// Resolve the effective config. When no HARNESS.md could be parsed (a
+	// fresh checkout often has none), fall back to a defaults-only config so
+	// the audit pipeline can still be exercised in dry-run.
+	cfg := res.Config
+	if res.Definition == nil {
+		var cErr error
+		cfg, cErr = config.Load(loadOpts)
+		if cErr != nil {
+			return fmt.Errorf("start: load config (no harness): %w", cErr)
+		}
+		if loadErr != nil {
+			rctx.log.Warn().Err(loadErr).Str("harness_path", harnessPath).
+				Msg("HARNESS.md not loaded; continuing with defaults")
+		}
+	}
 
 	rctx.log.Info().
 		Str("harness_path", harnessPath).
 		Bool("dry_run", flags.dryRun).
 		Msg("conductor starting")
 
-	// Best-effort validation: in Phase 1 most installations will not yet
-	// have a complete HARNESS.md, so we surface validation errors but do
-	// not exit on them when --dry-run is set. The orchestrator (Phase 6)
-	// will hard-fail on the same errors when it boots.
+	// Best-effort startup validation (SPEC §6.4). In dry-run we surface
+	// issues but continue; otherwise a bad config or harness is fatal. The
+	// orchestrator (Phase 6) will hard-fail on the same checks when it boots.
 	if err := config.Validate(cfg); err != nil {
 		if flags.dryRun {
 			rctx.log.Warn().Err(err).Msg("config validation reported issues")
 		} else {
-			return fmt.Errorf("start: load harness: %w", err)
+			return fmt.Errorf("start: validate config: %w", err)
+		}
+	}
+	if loadErr != nil && res.Definition != nil {
+		if flags.dryRun {
+			rctx.log.Warn().Err(loadErr).Msg("harness validation reported issues")
+		} else {
+			return fmt.Errorf("start: validate harness: %w", loadErr)
 		}
 	}
 
-	cfg := res.Config
-	if res.Definition == nil {
-		// No harness found, fall back to a defaults-only config so the
-		// audit pipeline can still be exercised in dry-run.
-		cfg, err = config.Load(config.LoadOptions{Flags: cmd.Flags()})
-		if err != nil {
-			return fmt.Errorf("start: load config (no harness): %w", err)
-		}
-	}
-
-	rctx.log.Info().
-		Str("harness_path", res.Path).
-		Str("harness_source", string(res.Source)).
-		Bool("dry_run", flags.dryRun).
-		Msg("conductor starting")
-
-	// Open the database to prove the audit pipeline works end-to-end.
-	// In Phase 2 we use an in-memory database when --dry-run is set so
-	// the command can run on a clean checkout without any state.
+	// Open the database to prove the audit pipeline works end-to-end. dry-run
+	// uses an in-memory database so the command runs on a clean checkout
+	// without leaving state behind.
 	dsn := ""
 	if !flags.dryRun {
 		dsn = "conductor.db"
@@ -128,10 +128,10 @@ func runStart(ctx context.Context, cmd *cobra.Command, rctx *rootContext, flags 
 		ProjectID: cfg.Project.ID,
 		EventType: audit.EventRunAttemptStarted,
 		Payload: map[string]any{
-			"phase":   1,
+			"phase":   2,
 			"dry_run": flags.dryRun,
 			"harness": harnessPath,
-			"comment": "phase-1 placeholder; orchestrator lands in Phase 6",
+			"comment": "placeholder; orchestrator lands in Phase 6",
 		},
 	}); err != nil {
 		return fmt.Errorf("start: write audit event: %w", err)
@@ -141,18 +141,28 @@ func runStart(ctx context.Context, cmd *cobra.Command, rctx *rootContext, flags 
 		out := cmd.OutOrStdout()
 		tmpls := sortedTemplateRoles(res.Definition)
 		if _, err := fmt.Fprintf(out,
-			"dry run complete: harness=%s (source=%s), templates=%v, audit pipeline verified\n",
-			res.Path, res.Source, tmpls,
+			"dry run complete: harness=%s, templates=%v, audit pipeline verified\n",
+			harnessPath, tmpls,
 		); err != nil {
 			return fmt.Errorf("start: write dry-run summary: %w", err)
 		}
 		return nil
 	}
 
-	if res.Definition != nil && res.Path != "" {
-		w := harness.NewWatcher(res.Path, res.Definition, cfg, harnessAuditAdapter{writer: writer, projectID: cfg.Project.ID}, rctx.log)
+	// Hot-reload HARNESS.md on disk changes (SPEC §6.3). The watcher emits
+	// ConfigReloaded / ConfigReloadFailed audit events through the same writer.
+	if res.Definition != nil {
+		w, err := harness.NewWatcher(harness.WatchOptions{
+			Path:     harnessPath,
+			LoadOpts: loadOpts,
+			Audit:    writer,
+			Logger:   rctx.log,
+		})
+		if err != nil {
+			return fmt.Errorf("start: create harness watcher: %w", err)
+		}
 		go func() {
-			if err := w.Run(ctx); err != nil {
+			if err := w.Start(ctx); err != nil {
 				rctx.log.Error().Err(err).Msg("harness watcher exited with error")
 			}
 		}()
@@ -172,26 +182,4 @@ func sortedTemplateRoles(def *harness.Definition) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// harnessAuditAdapter bridges the watcher's consumer-defined AuditWriter
-// interface to the real audit.Writer. The watcher cannot import
-// internal/audit directly (see internal/harness/watcher.go for the
-// rationale and docs/conventions.md §3.1 for the rule), so the cmd
-// layer — which is allowed to depend on both — supplies the adapter.
-type harnessAuditAdapter struct {
-	writer    *audit.Writer
-	projectID string
-}
-
-func (a harnessAuditAdapter) Write(ctx context.Context, evt harness.AuditEvent) error {
-	pid := evt.ProjectID
-	if pid == "" {
-		pid = a.projectID
-	}
-	return a.writer.Write(ctx, audit.AuditEvent{
-		ProjectID: pid,
-		EventType: audit.EventType(evt.EventType),
-		Payload:   evt.Payload,
-	})
 }
