@@ -9,6 +9,7 @@ import (
 	"github.com/conductor-sh/conductor/internal/audit"
 	"github.com/conductor-sh/conductor/internal/config"
 	"github.com/conductor-sh/conductor/internal/db"
+	"github.com/conductor-sh/conductor/internal/harness"
 )
 
 // startFlags captures the SPEC §19.2 surface of `conductor start`. Phase 1
@@ -41,8 +42,8 @@ func newStartCommand(rctx *rootContext) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&flags.harness, "harness", config.DefaultHarnessPath,
-		"path to HARNESS.md (default: ./HARNESS.md)")
+	cmd.Flags().StringVar(&flags.harness, "harness", "",
+		"path to HARNESS.md (default: $CONDUCTOR_HARNESS_PATH or ./HARNESS.md)")
 	cmd.Flags().IntVar(&flags.port, "port", 0, "override server.port")
 	cmd.Flags().BoolVar(&flags.noDashboard, "no-dashboard", false,
 		"disable the web dashboard")
@@ -61,8 +62,12 @@ func runStart(ctx context.Context, cmd *cobra.Command, rctx *rootContext, flags 
 		return fmt.Errorf("start: load config: %w", err)
 	}
 
+	// Resolve the HARNESS.md location per SPEC §5.1: --harness, then
+	// $CONDUCTOR_HARNESS_PATH, then the cwd default.
+	harnessPath := harness.ResolvePath(flags.harness, nil)
+
 	rctx.log.Info().
-		Str("harness_path", flags.harness).
+		Str("harness_path", harnessPath).
 		Bool("dry_run", flags.dryRun).
 		Msg("conductor starting")
 
@@ -105,7 +110,7 @@ func runStart(ctx context.Context, cmd *cobra.Command, rctx *rootContext, flags 
 		Payload: map[string]any{
 			"phase":   1,
 			"dry_run": flags.dryRun,
-			"harness": flags.harness,
+			"harness": harnessPath,
 			"comment": "phase-1 placeholder; orchestrator lands in Phase 6",
 		},
 	}); err != nil {
