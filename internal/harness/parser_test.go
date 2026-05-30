@@ -1,188 +1,225 @@
-package harness
+package harness_test
 
 import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/conductor-sh/conductor/internal/harness"
 )
 
 func TestParseBytes_FullDocument(t *testing.T) {
-	src := strings.Join([]string{
-		"---",
-		"project:",
-		"  id: demo",
-		"  name: Demo",
-		"tracker:",
-		"  kind: linear",
-		"---",
-		"",
-		"## planner",
-		"",
-		"Plan body line 1.",
-		"Plan body line 2.",
-		"",
-		"## coder",
-		"",
-		"Coder body.",
-		"",
-		"## verifier",
-		"",
-		"Verify body.",
-		"",
-		"## reviewer",
-		"",
-		"Reviewer body.",
-		"",
-	}, "\n")
+	t.Parallel()
 
-	def, err := parseBytes([]byte(src), "test.md")
+	src := []byte(`---
+project:
+  id: demo
+tracker:
+  kind: linear
+  api_key: $LINEAR_TOKEN
+---
+
+## planner
+
+Plan the work for {{ issue.identifier }}.
+
+## coder
+
+Implement the plan.
+
+## verifier
+
+Verify {{ issue.identifier }} passes its acceptance criteria.
+`)
+
+	def, err := harness.ParseBytes(src)
 	require.NoError(t, err)
+	require.NotNil(t, def)
 
-	require.NotNil(t, def.FrontMatter)
-	project, ok := def.FrontMatter["project"].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, "demo", project["id"])
+	require.Equal(t, "demo", def.FrontMatter["project"].(map[string]any)["id"])
+	require.Equal(t, "linear", def.FrontMatter["tracker"].(map[string]any)["kind"])
 
-	require.Contains(t, def.PromptTemplates, "planner")
-	require.Contains(t, def.PromptTemplates, "coder")
-	require.Contains(t, def.PromptTemplates, "verifier")
-	require.Contains(t, def.PromptTemplates, "reviewer")
-	require.Contains(t, def.PromptTemplates["planner"], "Plan body line 1.")
-	require.Contains(t, def.PromptTemplates["coder"], "Coder body.")
+	require.Equal(t, "Plan the work for {{ issue.identifier }}.", def.PromptTemplates["planner"])
+	require.Equal(t, "Implement the plan.", def.PromptTemplates["coder"])
+	require.Contains(t, def.PromptTemplates["verifier"], "{{ issue.identifier }}")
 }
 
 func TestParseBytes_NoFrontMatter(t *testing.T) {
-	src := "## coder\n\nThe body of the coder role.\n"
+	t.Parallel()
 
-	def, err := parseBytes([]byte(src), "")
+	src := []byte(`Implement {{ issue.title }}.
+
+This is a single-role harness.
+`)
+
+	def, err := harness.ParseBytes(src)
 	require.NoError(t, err)
 	require.Empty(t, def.FrontMatter)
-	require.Equal(t, "The body of the coder role.", def.PromptTemplates["coder"])
+	require.Contains(t, def.PromptTemplates, harness.DefaultRole,
+		"body without `## ` headings must default to the coder role (SPEC §5.2)")
+	require.Contains(t, def.PromptTemplates[harness.DefaultRole], "{{ issue.title }}")
 }
 
-func TestParseBytes_BodyWithoutHeadingsBecomesCoder(t *testing.T) {
-	src := "Just some text\nacross two lines\n"
+func TestParseBytes_FrontMatterOnly(t *testing.T) {
+	t.Parallel()
 
-	def, err := parseBytes([]byte(src), "")
+	src := []byte(`---
+project:
+  id: demo
+---
+`)
+
+	def, err := harness.ParseBytes(src)
 	require.NoError(t, err)
-	require.Equal(t, "Just some text\nacross two lines", def.PromptTemplates[DefaultRole])
-	// And no other roles materialized.
-	require.Len(t, def.PromptTemplates, 1)
+	require.Equal(t, "demo", def.FrontMatter["project"].(map[string]any)["id"])
+	require.Empty(t, def.PromptTemplates,
+		"empty body must produce no prompt templates rather than a stub coder entry")
 }
 
-func TestParseBytes_NonMapFrontMatterReportsShapeError(t *testing.T) {
-	src := strings.Join([]string{
-		"---",
-		"- one",
-		"- two",
-		"---",
-		"## coder",
-		"",
-		"Body.",
-	}, "\n")
+func TestParseBytes_UnclosedFrontMatter(t *testing.T) {
+	t.Parallel()
 
-	_, err := parseBytes([]byte(src), "")
+	src := []byte(`---
+project:
+  id: demo
+
+## coder
+
+body without a closing fence
+`)
+
+	_, err := harness.ParseBytes(src)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrHarnessFrontMatterShape), "expected ErrHarnessFrontMatterShape, got %v", err)
+	require.True(t, errors.Is(err, harness.ErrHarnessParse),
+		"unclosed front matter must surface as ErrHarnessParse, got %v", err)
 }
 
-func TestParseBytes_MissingClosingDelimiterIsParseError(t *testing.T) {
-	src := "---\nproject:\n  id: foo\n## coder\nbody\n"
+func TestParseBytes_NonMapFrontMatter(t *testing.T) {
+	t.Parallel()
 
-	_, err := parseBytes([]byte(src), "")
+	src := []byte(`---
+- this
+- is
+- a
+- list
+---
+
+## coder
+
+body
+`)
+
+	_, err := harness.ParseBytes(src)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrHarnessParse), "expected ErrHarnessParse, got %v", err)
+	require.True(t, errors.Is(err, harness.ErrHarnessFrontMatterShape),
+		"non-map root must surface as ErrHarnessFrontMatterShape, got %v", err)
 }
 
-func TestParseBytes_UnknownFrontMatterKeysAreKept(t *testing.T) {
-	src := strings.Join([]string{
-		"---",
-		"project:",
-		"  id: demo",
-		"experimental_setting: true",
-		"---",
-		"## coder",
-		"body",
-	}, "\n")
+func TestParseBytes_MalformedYAML(t *testing.T) {
+	t.Parallel()
 
-	def, err := parseBytes([]byte(src), "")
+	src := []byte("---\nproject:\n  id: \"unterminated\n---\n\n## coder\nbody\n")
+
+	_, err := harness.ParseBytes(src)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, harness.ErrHarnessParse),
+		"yaml syntax error must surface as ErrHarnessParse, got %v", err)
+}
+
+func TestParseBytes_NestedHeadingsStayInsideSection(t *testing.T) {
+	t.Parallel()
+
+	src := []byte(`## planner
+
+Outline:
+
+### Step 1
+
+Plan A.
+
+### Step 2
+
+Plan B.
+
+## coder
+
+Build it.
+`)
+
+	def, err := harness.ParseBytes(src)
 	require.NoError(t, err)
-	require.Equal(t, true, def.FrontMatter["experimental_setting"])
+	require.Contains(t, def.PromptTemplates["planner"], "### Step 1",
+		"### sub-headings must stay within the parent ## role section")
+	require.Contains(t, def.PromptTemplates["planner"], "### Step 2")
+	require.Equal(t, "Build it.", def.PromptTemplates["coder"])
+}
+
+func TestParseBytes_RoleNameLowercased(t *testing.T) {
+	t.Parallel()
+
+	src := []byte(`## Planner
+
+Plan.
+
+## VERIFIER
+
+Verify.
+`)
+
+	def, err := harness.ParseBytes(src)
+	require.NoError(t, err)
+	require.Contains(t, def.PromptTemplates, "planner",
+		"role names must be lowercased per SPEC §4.2 normalization rules")
+	require.Contains(t, def.PromptTemplates, "verifier")
 }
 
 func TestParseBytes_EmptyFrontMatterBlock(t *testing.T) {
-	src := "---\n---\n## coder\nbody\n"
+	t.Parallel()
 
-	def, err := parseBytes([]byte(src), "")
+	src := []byte(`---
+---
+
+## coder
+
+body
+`)
+
+	def, err := harness.ParseBytes(src)
 	require.NoError(t, err)
-	require.NotNil(t, def.FrontMatter)
+	require.NotNil(t, def.FrontMatter,
+		"empty front matter must decode to an empty (non-nil) map")
 	require.Empty(t, def.FrontMatter)
-	require.Equal(t, "body", def.PromptTemplates["coder"])
 }
 
-func TestParseBytes_BOMAndBlankPrefixToleratedOnlyForBOM(t *testing.T) {
-	src := "\ufeff" + "---\nproject:\n  id: demo\n---\n## coder\nbody"
+func TestParseFile_RoundTrip(t *testing.T) {
+	t.Parallel()
 
-	def, err := parseBytes([]byte(src), "")
-	require.NoError(t, err)
-	project, ok := def.FrontMatter["project"].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, "demo", project["id"])
-}
-
-func TestParseBytes_RoleHeadingWithTrailingComment(t *testing.T) {
-	src := strings.Join([]string{
-		"---",
-		"project:",
-		"  id: demo",
-		"---",
-		"## planner (the planning step)",
-		"plan body",
-		"## coder",
-		"code body",
-	}, "\n")
-
-	def, err := parseBytes([]byte(src), "")
-	require.NoError(t, err)
-	require.Equal(t, "plan body", def.PromptTemplates["planner"])
-	require.Equal(t, "code body", def.PromptTemplates["coder"])
-}
-
-func TestParseBytes_LevelThreeHeadingDoesNotSplit(t *testing.T) {
-	src := strings.Join([]string{
-		"## coder",
-		"intro",
-		"### subsection",
-		"more body",
-	}, "\n")
-
-	def, err := parseBytes([]byte(src), "")
-	require.NoError(t, err)
-	require.Contains(t, def.PromptTemplates["coder"], "intro")
-	require.Contains(t, def.PromptTemplates["coder"], "### subsection")
-	require.Contains(t, def.PromptTemplates["coder"], "more body")
-}
-
-func TestParse_ReadsFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "HARNESS.md")
-	body := "---\nproject:\n  id: ondisk\n---\n## coder\nbody"
-	require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte(`---
+project: { id: demo }
+---
 
-	def, err := Parse(path)
+## coder
+
+Hello.
+`), 0o600))
+
+	def, err := harness.ParseFile(path)
 	require.NoError(t, err)
-	require.Equal(t, path, def.SourcePath)
-	project, ok := def.FrontMatter["project"].(map[string]any)
-	require.True(t, ok)
-	require.Equal(t, "ondisk", project["id"])
+	require.Equal(t, path, def.Source,
+		"ParseFile must populate Source so reload paths can compare against it")
+	require.Equal(t, "Hello.", def.PromptTemplates["coder"])
 }
 
-func TestParse_MissingFileWrapsParseError(t *testing.T) {
-	_, err := Parse(filepath.Join(t.TempDir(), "nope.md"))
+func TestParseFile_Missing(t *testing.T) {
+	t.Parallel()
+
+	_, err := harness.ParseFile(filepath.Join(t.TempDir(), "does-not-exist.md"))
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrHarnessParse))
+	require.True(t, errors.Is(err, harness.ErrMissingHarnessFile),
+		"missing file must classify as ErrMissingHarnessFile, got %v", err)
 }

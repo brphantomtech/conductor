@@ -1,260 +1,282 @@
-package harness
+package harness_test
 
 import (
 	"context"
-	"errors"
 	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/require"
 
-	"github.com/conductor-sh/conductor/internal/config"
+	"github.com/conductor-sh/conductor/internal/audit"
+	"github.com/conductor-sh/conductor/internal/harness"
 )
 
-// captureWriter is an AuditWriter that retains every emitted event.
-type captureWriter struct {
+// recorderSink captures every AuditEvent the Watcher emits so tests can
+// assert ConfigReloaded / ConfigReloadFailed are reaching the audit
+// pipeline. Implements audit.Sink.
+type recorderSink struct {
 	mu     sync.Mutex
-	events []AuditEvent
+	events []audit.AuditEvent
 }
 
-func (c *captureWriter) Write(_ context.Context, evt AuditEvent) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.events = append(c.events, evt)
+func (r *recorderSink) Write(_ context.Context, evt audit.AuditEvent) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.events = append(r.events, evt)
 	return nil
 }
 
-func (c *captureWriter) snapshot() []AuditEvent {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	out := make([]AuditEvent, len(c.events))
-	copy(out, c.events)
+func (r *recorderSink) Close() error { return nil }
+
+func (r *recorderSink) snapshot() []audit.AuditEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]audit.AuditEvent, len(r.events))
+	copy(out, r.events)
 	return out
 }
 
-func (c *captureWriter) reset() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.events = nil
-}
-
-// waitFor polls cond every step until it returns true or deadline
-// elapses. Returns the value of the last call.
-func waitFor(deadline time.Duration, step time.Duration, cond func() bool) bool {
-	end := time.Now().Add(deadline)
-	for time.Now().Before(end) {
-		if cond() {
-			return true
-		}
-		time.Sleep(step)
-	}
-	return cond()
-}
-
-func newTestWatcher(t *testing.T, path string, initial *Definition) (*Watcher, *captureWriter) {
+func newWatcherTest(t *testing.T, body string) (*harness.Watcher, *recorderSink, string, func()) {
 	t.Helper()
-	writer := &captureWriter{}
-	cfg := validCfg()
-	w := NewWatcher(path, initial, cfg, writer, zerolog.Nop())
-	// Drop debounce to a much smaller window for tests.
-	w.debounce = 30 * time.Millisecond
-	return w, writer
-}
-
-func TestWatcher_CleanReloadEmitsConfigReloaded(t *testing.T) {
 	dir := t.TempDir()
-	path := writeFile(t, dir, "HARNESS.md", validHarnessYAML)
+	path := filepath.Join(dir, "HARNESS.md")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
 
-	def, err := Parse(path)
+	rec := &recorderSink{}
+	writer := audit.NewWriter(zerolog.Nop())
+	writer.AddSink(rec)
+
+	w, err := harness.NewWatcher(harness.WatchOptions{
+		Path:     path,
+		Audit:    writer,
+		Logger:   zerolog.Nop(),
+		Debounce: 25 * time.Millisecond,
+	})
 	require.NoError(t, err)
 
-	w, writer := newTestWatcher(t, path, def)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	go func() { _ = w.Run(ctx) }()
-
-	// Let the watcher attach.
-	time.Sleep(50 * time.Millisecond)
-
-	// Modify the file: change project.id from `demo` to `demo2`.
-	updated := validHarnessYAML
-	require.NoError(t, os.WriteFile(path, []byte(updated+"\n# touched"), 0o644))
-
-	ok := waitFor(2*time.Second, 25*time.Millisecond, func() bool {
-		for _, e := range writer.snapshot() {
-			if e.EventType == string(eventConfigReloaded) {
-				return true
-			}
-		}
-		return false
-	})
-	require.True(t, ok, "expected ConfigReloaded event, got %+v", writer.snapshot())
-
-	live := w.Live()
-	require.NotNil(t, live)
-	require.Contains(t, live.PromptTemplates, "coder")
-}
-
-func TestWatcher_ParseFailurePreservesLastKnownGood(t *testing.T) {
-	dir := t.TempDir()
-	path := writeFile(t, dir, "HARNESS.md", validHarnessYAML)
-
-	def, err := Parse(path)
-	require.NoError(t, err)
-
-	w, writer := newTestWatcher(t, path, def)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = w.Run(ctx) }()
-
-	time.Sleep(50 * time.Millisecond)
-
-	// Write malformed front matter (opening delimiter, no close).
-	bad := "---\nproject:\n  id: foo\n## coder\nbody\n"
-	require.NoError(t, os.WriteFile(path, []byte(bad), 0o644))
-
-	ok := waitFor(2*time.Second, 25*time.Millisecond, func() bool {
-		for _, e := range writer.snapshot() {
-			if e.EventType == string(eventConfigReloadFailed) {
-				return true
-			}
-		}
-		return false
-	})
-	require.True(t, ok, "expected ConfigReloadFailed event, got %+v", writer.snapshot())
-
-	// Live definition unchanged.
-	live := w.Live()
-	require.NotNil(t, live)
-	project, _ := live.FrontMatter["project"].(map[string]any)
-	require.Equal(t, "demo", project["id"])
-
-	// Payload carries an error_code derived from the harness sentinel.
-	var failed AuditEvent
-	for _, e := range writer.snapshot() {
-		if e.EventType == string(eventConfigReloadFailed) {
-			failed = e
-			break
-		}
+	cleanup := func() {
+		_ = w.Close()
+		_ = writer.Close()
 	}
-	require.Equal(t, "harness_parse_error", failed.Payload["error_code"])
+	return w, rec, path, cleanup
 }
 
-func TestWatcher_ValidationFailurePreservesLastKnownGood(t *testing.T) {
+func TestWatcher_InitialLoad(t *testing.T) {
+	t.Parallel()
+
+	w, _, _, cleanup := newWatcherTest(t, validHarnessSrc)
+	defer cleanup()
+
+	cur := w.Current()
+	require.NotNil(t, cur.Definition)
+	require.Equal(t, "demo", cur.Config.Project.ID)
+}
+
+func TestWatcher_ReloadsOnFileChange(t *testing.T) {
+	t.Parallel()
+
 	dir := t.TempDir()
-	path := writeFile(t, dir, "HARNESS.md", validHarnessYAML)
+	path := filepath.Join(dir, "HARNESS.md")
+	require.NoError(t, os.WriteFile(path, []byte(validHarnessSrc), 0o600))
 
-	def, err := Parse(path)
+	rec := &recorderSink{}
+	writer := audit.NewWriter(zerolog.Nop())
+	writer.AddSink(rec)
+	t.Cleanup(func() { _ = writer.Close() })
+
+	updated := make(chan struct{}, 4)
+	var updates int32
+	w, err := harness.NewWatcher(harness.WatchOptions{
+		Path:     path,
+		Audit:    writer,
+		Logger:   zerolog.Nop(),
+		Debounce: 25 * time.Millisecond,
+		OnUpdate: func(_ harness.LoadResult) {
+			atomic.AddInt32(&updates, 1)
+			select {
+			case updated <- struct{}{}:
+			default:
+			}
+		},
+	})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = w.Close() })
 
-	w, writer := newTestWatcher(t, path, def)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() { _ = w.Run(ctx) }()
-	time.Sleep(50 * time.Millisecond)
+	require.NoError(t, w.Start(ctx))
 
-	// Rewrite the file so it parses but pipeline mentions a missing role.
-	body := `---
-project:
-  id: demo
+	// Mutate the polling.interval_ms so we can detect the swap.
+	require.NoError(t, os.WriteFile(path, []byte(`---
+project: { id: demo }
 tracker:
   kind: linear
-  api_key: secret
-  project_slug: team
+  api_key: t
+  project_slug: x
 providers:
   default:
-    provider: anthropic
-    api_key: ank
-routing:
-  pipeline: [planner, coder, reviewer]
+    provider: openrouter
+    api_key: sk
+polling:
+  interval_ms: 9999
 ---
 
 ## planner
+Plan {{ issue.identifier }}.
+## coder
+Implement {{ issue.title }}.
+## verifier
+Verify {{ issue.identifier }}.
+`), 0o600))
 
-p
+	select {
+	case <-updated:
+	case <-time.After(3 * time.Second):
+		t.Fatal("watcher did not fire OnUpdate within 3s")
+	}
+
+	cur := w.Current()
+	require.Equal(t, 9999, cur.Config.Polling.IntervalMS)
+
+	// Settle window for any trailing event before we inspect the audit
+	// log; fsnotify on Windows can fire a Chmod after a Write.
+	time.Sleep(100 * time.Millisecond)
+
+	events := rec.snapshot()
+	hasReloaded := false
+	for _, e := range events {
+		if e.EventType == audit.EventConfigReloaded {
+			hasReloaded = true
+			break
+		}
+	}
+	require.True(t, hasReloaded,
+		"successful reload must emit ConfigReloaded (SPEC §17.2)")
+}
+
+func TestWatcher_KeepsLastGoodOnReloadFailure(t *testing.T) {
+	t.Parallel()
+
+	w, rec, path, cleanup := newWatcherTest(t, validHarnessSrc)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, w.Start(ctx))
+
+	good := w.Current()
+	require.Equal(t, "demo", good.Config.Project.ID)
+
+	// Write a malformed front matter block.
+	require.NoError(t, os.WriteFile(path, []byte(`---
+- not a map
+---
 
 ## coder
+body
+`), 0o600))
 
-c
-`
-	require.NoError(t, os.WriteFile(path, []byte(body), 0o644))
-
-	ok := waitFor(2*time.Second, 25*time.Millisecond, func() bool {
-		for _, e := range writer.snapshot() {
-			if e.EventType == string(eventConfigReloadFailed) {
+	require.Eventually(t, func() bool {
+		for _, e := range rec.snapshot() {
+			if e.EventType == audit.EventConfigReloadFailed {
 				return true
 			}
 		}
 		return false
-	})
-	require.True(t, ok, "expected ConfigReloadFailed event")
-	require.NotNil(t, w.Live())
+	}, 3*time.Second, 25*time.Millisecond,
+		"failed reload must emit ConfigReloadFailed (SPEC §17.2)")
+
+	cur := w.Current()
+	require.Equal(t, "demo", cur.Config.Project.ID,
+		"failed reload must leave the last known good Config in place (SPEC §6.3)")
 }
 
-func TestWatcher_BurstyWritesCoalesce(t *testing.T) {
-	dir := t.TempDir()
-	path := writeFile(t, dir, "HARNESS.md", validHarnessYAML)
-
-	def, err := Parse(path)
-	require.NoError(t, err)
-
-	w, writer := newTestWatcher(t, path, def)
-	w.debounce = 80 * time.Millisecond
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go func() { _ = w.Run(ctx) }()
-	time.Sleep(50 * time.Millisecond)
-
-	writer.reset()
-
-	// Five quick rewrites within < debounce.
-	for i := 0; i < 5; i++ {
-		require.NoError(t, os.WriteFile(path, []byte(validHarnessYAML), 0o644))
-		time.Sleep(10 * time.Millisecond)
-	}
-	// Wait long enough for the debounce to fire once.
-	time.Sleep(300 * time.Millisecond)
-
-	events := writer.snapshot()
-	// At most one reload event for this burst.
-	count := 0
-	for _, e := range events {
-		if e.EventType == string(eventConfigReloaded) {
-			count++
-		}
-	}
-	require.LessOrEqual(t, count, 1, "expected at most 1 ConfigReloaded across coalesced burst, got %d (events=%v)", count, events)
-}
-
-func TestWatcher_NilSafety(t *testing.T) {
-	var w *Watcher
-	require.Nil(t, w.Live())
-	require.Equal(t, "", w.Path())
-	err := w.Run(context.Background())
+func TestNewWatcher_RejectsEmptyPath(t *testing.T) {
+	t.Parallel()
+	_, err := harness.NewWatcher(harness.WatchOptions{})
 	require.Error(t, err)
 }
 
-func TestWatcher_NoWriterFallsBackToNop(t *testing.T) {
-	cfg := validCfg()
-	w := NewWatcher("HARNESS.md", validDef(), cfg, nil, zerolog.Nop())
-	require.NotNil(t, w)
-	// reloadOnce on a nonexistent path should produce a ConfigReloadFailed
-	// classification but not panic. We just confirm no panic happens.
-	w.reloadOnce(context.Background())
+func TestNewWatcher_FailsOnMissingFile(t *testing.T) {
+	t.Parallel()
+	_, err := harness.NewWatcher(harness.WatchOptions{
+		Path:   filepath.Join(t.TempDir(), "no-such.md"),
+		Logger: zerolog.Nop(),
+	})
+	require.Error(t, err)
+	require.ErrorIs(t, err, harness.ErrMissingHarnessFile)
 }
 
-func TestClassifyAuditErrorCode(t *testing.T) {
-	require.Equal(t, "missing_harness_file", classifyAuditErrorCode(ErrMissingHarnessFile))
-	require.Equal(t, "harness_parse_error", classifyAuditErrorCode(ErrHarnessParse))
-	require.Equal(t, "template_render_error", classifyAuditErrorCode(ErrTemplateRender))
-	require.Equal(t, "harness_reload_failed", classifyAuditErrorCode(errors.New("nope")))
+func TestEnsureExists(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	require.ErrorIs(t,
+		harness.EnsureExists(filepath.Join(dir, "missing.md")),
+		harness.ErrMissingHarnessFile)
+	require.ErrorIs(t,
+		harness.EnsureExists(dir),
+		harness.ErrMissingHarnessFile,
+		"directories must be reported as missing-file errors")
+
+	path := filepath.Join(dir, "HARNESS.md")
+	require.NoError(t, os.WriteFile(path, []byte("hi"), 0o600))
+	require.NoError(t, harness.EnsureExists(path))
 }
 
-func TestWatcher_RunRequiresPath(t *testing.T) {
-	w := NewWatcher("", nil, config.Config{}, nil, zerolog.Nop())
-	require.Error(t, w.Run(context.Background()))
+func TestWatcher_StartIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	w, _, _, cleanup := newWatcherTest(t, validHarnessSrc)
+	defer cleanup()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	require.NoError(t, w.Start(ctx))
+	require.Error(t, w.Start(ctx),
+		"calling Start a second time must return an error rather than panicking")
+}
+
+func TestWatcher_ConfigLevelValidationStillReturnsResult(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "HARNESS.md")
+	// Pipeline references a role that has no `## planner` template, but
+	// the harness itself parses cleanly. NewWatcher should surface the
+	// validation error AND populate Current().
+	require.NoError(t, os.WriteFile(path, []byte(`---
+project: { id: demo }
+tracker:
+  kind: linear
+  api_key: t
+  project_slug: x
+providers:
+  default:
+    provider: openrouter
+    api_key: sk
+---
+
+## coder
+Implement.
+`), 0o600))
+
+	w, err := harness.NewWatcher(harness.WatchOptions{
+		Path:   path,
+		Logger: zerolog.Nop(),
+	})
+	require.Error(t, err,
+		"validation failures at startup must be returned to the caller (SPEC §6.4)")
+	require.NotNil(t, w,
+		"NewWatcher must still return a Watcher when the failure is at validation time, not parse time")
+	t.Cleanup(func() { _ = w.Close() })
+
+	cur := w.Current()
+	require.Equal(t, "demo", cur.Config.Project.ID,
+		"Current must surface the parsed config even when validation reported issues")
 }

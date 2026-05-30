@@ -1,91 +1,88 @@
 package harness
 
 import (
-	"github.com/spf13/pflag"
+	"fmt"
 
 	"github.com/conductor-sh/conductor/internal/config"
 )
 
-// LoadOptions controls a single Load call. The zero value is usable: a
-// nil Env falls back to os.LookupEnv, an empty Cwd falls back to
-// os.Getwd, and a nil CLIFlags simply skips flag binding (useful for
-// offline / test callers).
-type LoadOptions struct {
-	// Flag is the literal value of the --harness flag. Empty means
-	// "unset, fall back to env / cwd".
-	Flag string
-
-	// Env is the environment lookup function. nil → os.LookupEnv.
-	Env EnvLookup
-
-	// Cwd overrides the working directory used for cwd-relative lookups.
-	// Empty → os.Getwd. Tests pass a temp dir here.
-	Cwd string
-
-	// CLIFlags is the Cobra/pflag flag set whose values should win over
-	// env vars and YAML when config.Load merges sources. nil → skipped.
-	CLIFlags *pflag.FlagSet
-
-	// ConfigLookup is the environment lookup function used by
-	// config.Load when expanding `$VAR` references inside YAML values.
-	// Distinct from Env so tests can isolate the two — production
-	// callers leave both nil.
-	ConfigLookup config.LookupFunc
-}
-
-// Result bundles everything Load produces. The Definition is the parsed
-// HARNESS.md, the Config is the merged-and-expanded settings, and the
-// Source tells the caller which discovery branch produced the file.
+// LoadResult bundles everything a hot-reload consumer needs after a single
+// load cycle: the parsed Definition, the typed Config decoded from its
+// front matter, and the structured ValidationResult.
 //
-// All three fields are populated on success. On error, Definition and
-// Source may still be populated (so callers like `harness validate` can
-// pretty-print the path that failed) while Config is the zero value.
-type Result struct {
+// Two consumers read this:
+//   - The CLI's `conductor harness validate` subcommand renders Result.Issues.
+//   - The Watcher publishes Result via callback so the orchestrator can
+//     swap in the new Config and PromptTemplates atomically.
+type LoadResult struct {
 	Definition *Definition
 	Config     config.Config
-	Source     Source
-	Path       string
+	Validation ValidationResult
 }
 
-// Load implements the SPEC §5 + §6 end-to-end startup path:
+// Load is the high-level entry point: parse HARNESS.md from path, decode
+// its front matter into the typed Config (with $VAR expansion and the
+// SPEC §6.1 precedence chain applied), and run Validate.
 //
-//  1. Resolve the HARNESS.md path per §5.1.
-//  2. Parse the file per §5.2.
-//  3. Merge config (defaults → front matter → env → flags) per §6.1.
-//  4. Validate per §6.4 + the role/template coverage rule.
+// Load returns LoadResult even on validation failure so the caller can
+// inspect Issues — only parser/config-decode errors short-circuit.
 //
-// Each stage's failure short-circuits the next. The returned Result
-// always reflects what stages did complete: a parse error returns the
-// resolved path and Source so the CLI can name the file in its error
-// output.
-func Load(opts LoadOptions) (Result, error) {
-	path, source, err := Resolve(opts.Flag, opts.Env, opts.Cwd)
+// Errors classified per SPEC §23.1 and §23.x via wrapped sentinels:
+//   - ErrMissingHarnessFile, ErrHarnessParse, ErrHarnessFrontMatterShape
+//     come from ParseFile.
+//   - config.ErrUnsetVariable comes from $VAR expansion when an env-var
+//     reference resolves to nothing.
+//   - ErrTemplateParse, ErrTemplateRender come from Validate.
+func Load(path string, opts config.LoadOptions) (LoadResult, error) {
+	def, err := ParseFile(path)
 	if err != nil {
-		return Result{Source: source, Path: path}, err
+		return LoadResult{}, err
 	}
 
-	def, err := Parse(path)
+	opts.FrontMatter = def.FrontMatter
+	cfg, err := config.Load(opts)
 	if err != nil {
-		return Result{Source: source, Path: path}, err
+		return LoadResult{Definition: def}, fmt.Errorf("harness: load config from front matter: %w", err)
 	}
 
-	cfg, err := config.Load(config.LoadOptions{
-		Flags:       opts.CLIFlags,
-		FrontMatter: def.FrontMatter,
-		Lookup:      opts.ConfigLookup,
-	})
-	if err != nil {
-		return Result{Definition: def, Source: source, Path: path}, err
-	}
-
-	if err := Validate(def, cfg); err != nil {
-		return Result{Definition: def, Config: cfg, Source: source, Path: path}, err
-	}
-
-	return Result{
+	res, vErr := Validate(def, cfg)
+	out := LoadResult{
 		Definition: def,
 		Config:     cfg,
-		Source:     source,
-		Path:       path,
-	}, nil
+		Validation: res,
+	}
+	if vErr != nil {
+		return out, vErr
+	}
+	return out, nil
+}
+
+// LoadBytes is the in-memory equivalent of Load, used by the watcher when a
+// reload event delivers content via fsnotify (the fsnotify event already
+// triggered a re-read; LoadBytes lets tests pass content directly).
+//
+// Source on the returned Definition is left as the empty string; callers
+// can populate it themselves if they need a path for diagnostic messages.
+func LoadBytes(data []byte, opts config.LoadOptions) (LoadResult, error) {
+	def, err := ParseBytes(data)
+	if err != nil {
+		return LoadResult{}, err
+	}
+
+	opts.FrontMatter = def.FrontMatter
+	cfg, err := config.Load(opts)
+	if err != nil {
+		return LoadResult{Definition: def}, fmt.Errorf("harness: load config from front matter: %w", err)
+	}
+
+	res, vErr := Validate(def, cfg)
+	out := LoadResult{
+		Definition: def,
+		Config:     cfg,
+		Validation: res,
+	}
+	if vErr != nil {
+		return out, vErr
+	}
+	return out, nil
 }

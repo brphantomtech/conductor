@@ -46,7 +46,7 @@ func newStartCommand(rctx *rootContext) *cobra.Command {
 	}
 
 	cmd.Flags().StringVar(&flags.harness, "harness", "",
-		"path to HARNESS.md (default: env CONDUCTOR_HARNESS_PATH or ./HARNESS.md)")
+		"path to HARNESS.md (default: $CONDUCTOR_HARNESS_PATH or ./HARNESS.md)")
 	cmd.Flags().IntVar(&flags.port, "port", 0, "override server.port")
 	cmd.Flags().BoolVar(&flags.noDashboard, "no-dashboard", false,
 		"disable the web dashboard")
@@ -63,14 +63,25 @@ func runStart(ctx context.Context, cmd *cobra.Command, rctx *rootContext, flags 
 		CLIFlags: cmd.Flags(),
 	})
 	if err != nil {
-		// In a dry-run, surface validation errors as warnings so an
-		// incomplete HARNESS.md doesn't block the audit smoke test —
-		// matches the Phase 1 ergonomics operators are used to. For
-		// non-dry-run we fail loud.
-		if flags.dryRun && res.Definition != nil {
-			rctx.log.Warn().Err(err).Str("path", res.Path).Msg("harness validation reported issues")
-		} else if flags.dryRun && errors.Is(err, harness.ErrMissingHarnessFile) {
-			rctx.log.Warn().Err(err).Msg("no HARNESS.md found; continuing with defaults")
+		return fmt.Errorf("start: load config: %w", err)
+	}
+
+	// Resolve the HARNESS.md location per SPEC §5.1: --harness, then
+	// $CONDUCTOR_HARNESS_PATH, then the cwd default.
+	harnessPath := harness.ResolvePath(flags.harness, nil)
+
+	rctx.log.Info().
+		Str("harness_path", harnessPath).
+		Bool("dry_run", flags.dryRun).
+		Msg("conductor starting")
+
+	// Best-effort validation: in Phase 1 most installations will not yet
+	// have a complete HARNESS.md, so we surface validation errors but do
+	// not exit on them when --dry-run is set. The orchestrator (Phase 6)
+	// will hard-fail on the same errors when it boots.
+	if err := config.Validate(cfg); err != nil {
+		if flags.dryRun {
+			rctx.log.Warn().Err(err).Msg("config validation reported issues")
 		} else {
 			return fmt.Errorf("start: load harness: %w", err)
 		}
@@ -117,11 +128,10 @@ func runStart(ctx context.Context, cmd *cobra.Command, rctx *rootContext, flags 
 		ProjectID: cfg.Project.ID,
 		EventType: audit.EventRunAttemptStarted,
 		Payload: map[string]any{
-			"phase":          2,
-			"dry_run":        flags.dryRun,
-			"harness":        res.Path,
-			"harness_source": string(res.Source),
-			"comment":        "phase-2 placeholder; orchestrator lands in Phase 6",
+			"phase":   1,
+			"dry_run": flags.dryRun,
+			"harness": harnessPath,
+			"comment": "phase-1 placeholder; orchestrator lands in Phase 6",
 		},
 	}); err != nil {
 		return fmt.Errorf("start: write audit event: %w", err)

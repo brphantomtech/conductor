@@ -4,285 +4,354 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
-	"sort"
-	"sync/atomic"
+	"sync"
 	"time"
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/rs/zerolog"
 
+	"github.com/conductor-sh/conductor/internal/audit"
 	"github.com/conductor-sh/conductor/internal/config"
 )
 
-// DefaultReloadDebounce is the SPEC §6.3 reload coalescing window. 250ms
-// is short enough to feel snappy after a single save and long enough to
-// swallow the "atomic save" rename-then-create patterns several editors
-// emit on Windows.
-const DefaultReloadDebounce = 250 * time.Millisecond
+// SPEC §6.3 — Dynamic Reload.
+//
+// Watcher tails HARNESS.md and atomically swaps the in-memory LoadResult
+// whenever a successful reload completes. Failed reloads (parse error,
+// validation error, $VAR expansion failure) leave the previous good
+// LoadResult in place and emit a ConfigReloadFailed audit event.
 
-// auditEventType mirrors the audit package's EventType without importing
-// it. We keep the strings in sync via tests rather than a Go import so
-// the harness package stays a pure Tier-2 domain engine (audit is
-// Tier 1; this file's events are emitted *through* an injected writer,
-// not by reaching into the audit package directly).
-type auditEventType string
+// DefaultDebounce is the SPEC §6.3 default reload coalescing window.
+// Editors often emit a flurry of write/rename/chmod events when saving;
+// debouncing lets the watcher absorb that burst into a single reload.
+const DefaultDebounce = 250 * time.Millisecond
 
-const (
-	eventConfigReloaded     auditEventType = "ConfigReloaded"
-	eventConfigReloadFailed auditEventType = "ConfigReloadFailed"
-)
+// WatchOptions configures NewWatcher. The zero value is not usable: Path
+// is required.
+type WatchOptions struct {
+	// Path is the absolute or workspace-relative HARNESS.md location.
+	Path string
 
-// AuditEvent is the minimal payload the watcher emits. It is
-// structurally compatible with `internal/audit`.AuditEvent so cmd-layer
-// callers can wrap an audit.Writer once and forward straight through.
-type AuditEvent struct {
-	ProjectID string
-	EventType string
-	Payload   map[string]any
+	// LoadOpts is forwarded to config.Load on every reload. The watcher
+	// overwrites LoadOpts.FrontMatter from the parsed Definition before
+	// each load, so the caller's value (if any) is ignored.
+	LoadOpts config.LoadOptions
+
+	// Audit is the writer that receives ConfigReloaded /
+	// ConfigReloadFailed events. nil disables audit emission.
+	Audit *audit.Writer
+
+	// Debounce coalesces rapid event bursts. Zero falls back to
+	// DefaultDebounce.
+	Debounce time.Duration
+
+	// Logger is used for structured logs around reload outcomes. The
+	// zerolog zero value (a disabled logger) is acceptable.
+	Logger zerolog.Logger
+
+	// OnUpdate fires once per successful reload, on the watcher's
+	// goroutine. It is invoked AFTER the in-memory LoadResult has been
+	// swapped, so a callback that calls Current sees the new value. nil
+	// disables the callback.
+	OnUpdate func(LoadResult)
 }
 
-// AuditWriter is the consumer-defined interface (per
-// docs/conventions.md §3.1) the watcher uses to publish reload audit
-// events. The cmd layer adapts internal/audit.Writer to this shape.
-type AuditWriter interface {
-	Write(ctx context.Context, evt AuditEvent) error
-}
-
-// nopAuditWriter is the safe default when the caller does not inject a
-// writer (tests that only care about live-pointer behavior).
-type nopAuditWriter struct{}
-
-func (nopAuditWriter) Write(_ context.Context, _ AuditEvent) error { return nil }
-
-// Watcher is the fsnotify-backed reload pump. It owns:
-//
-//   - the path to HARNESS.md;
-//   - an atomic pointer to the currently-active Definition;
-//   - an AuditWriter that receives ConfigReloaded / ConfigReloadFailed
-//     events;
-//   - the merged Config snapshot used for revalidation.
-//
-// Downstream readers (orchestrator, router) call (*Watcher).Live() once
-// per dispatch tick to get the freshest valid Definition without
-// blocking. The pointer is only swapped after a successful parse +
-// validate, so readers never observe an intermediate state.
+// Watcher hot-reloads HARNESS.md. The orchestrator constructs one at
+// startup, calls Start, and reads Current under its hot path.
 type Watcher struct {
-	path     string
-	debounce time.Duration
+	opts     WatchOptions
+	fs       *fsnotify.Watcher
+	dir      string
+	filename string
 
-	live   *atomic.Pointer[Definition]
-	cfg    *atomic.Pointer[config.Config]
-	writer AuditWriter
-	log    zerolog.Logger
+	mu      sync.RWMutex
+	current LoadResult
+
+	stopOnce sync.Once
+	started  bool
+	stopped  chan struct{}
+	done     chan struct{}
 }
 
-// NewWatcher constructs a Watcher with the SPEC §6.3 defaults. The
-// `initial` Definition becomes the first "live" snapshot — typically the
-// one returned by Load on startup. The `cfg` is the merged config
-// snapshot validation will run against on reload; if reload-time config
-// re-derivation is desired, callers can re-create the Watcher.
+// NewWatcher performs the initial load and prepares an fsnotify subscription
+// on the parent directory of opts.Path. It does NOT start the watch loop —
+// call Start once you have a context that controls the watcher's lifetime.
 //
-// writer may be nil; the watcher substitutes a nop sink so callers that
-// do not want audit emissions can keep using it the same way.
-func NewWatcher(path string, initial *Definition, cfg config.Config, writer AuditWriter, log zerolog.Logger) *Watcher {
-	w := &Watcher{
-		path:     path,
-		debounce: DefaultReloadDebounce,
-		live:     &atomic.Pointer[Definition]{},
-		cfg:      &atomic.Pointer[config.Config]{},
-		writer:   writer,
-		log:      log.With().Str("subsystem", "harness").Logger(),
+// NewWatcher returns the initial load error verbatim so callers can decide
+// whether to abort startup (SPEC §6.4 hard-fail) or fall back. The returned
+// Watcher is non-nil whenever the initial parse and config-decode succeeded;
+// validation issues alone leave Current populated and Start callable.
+func NewWatcher(opts WatchOptions) (*Watcher, error) {
+	if opts.Path == "" {
+		return nil, errors.New("harness: watcher requires a non-empty path")
 	}
-	if writer == nil {
-		w.writer = nopAuditWriter{}
-	}
-	if initial != nil {
-		w.live.Store(initial)
-	}
-	cfgCopy := cfg
-	w.cfg.Store(&cfgCopy)
-	return w
-}
-
-// Live returns the active Definition, or nil if no successful load has
-// happened yet. Safe to call concurrently with Run.
-func (w *Watcher) Live() *Definition {
-	if w == nil {
-		return nil
-	}
-	return w.live.Load()
-}
-
-// Path returns the file the watcher is monitoring.
-func (w *Watcher) Path() string {
-	if w == nil {
-		return ""
-	}
-	return w.path
-}
-
-// Run starts the fsnotify watch loop. It blocks until ctx is cancelled
-// or the underlying fsnotify watcher errors. Returns nil on graceful
-// shutdown via ctx; a non-nil return is always a setup error.
-//
-// Run watches the *directory* containing the harness file (not the file
-// itself) because several editors implement atomic saves by writing a
-// temp file and renaming it over the target — an inode-level rename
-// drops a file-level watch.
-func (w *Watcher) Run(ctx context.Context) error {
-	if w == nil {
-		return errors.New("harness: Run on nil Watcher")
-	}
-	if w.path == "" {
-		return errors.New("harness: Watcher has empty path")
-	}
-
-	fsw, err := fsnotify.NewWatcher()
+	abs, err := filepath.Abs(opts.Path)
 	if err != nil {
-		return fmt.Errorf("harness: fsnotify.NewWatcher: %w", err)
+		return nil, fmt.Errorf("harness: resolve watch path %q: %w", opts.Path, err)
 	}
-	defer func() { _ = fsw.Close() }()
+	opts.Path = abs
 
-	dir := filepath.Dir(w.path)
-	if err := fsw.Add(dir); err != nil {
-		return fmt.Errorf("harness: fsnotify.Add(%s): %w", dir, err)
+	if opts.Debounce <= 0 {
+		opts.Debounce = DefaultDebounce
 	}
 
-	base := filepath.Base(w.path)
-	var debounceTimer *time.Timer
-	defer func() {
-		if debounceTimer != nil {
-			debounceTimer.Stop()
+	res, loadErr := Load(opts.Path, opts.LoadOpts)
+	if loadErr != nil && res.Definition == nil {
+		// Parse-level failure: cannot even produce a LoadResult.
+		return nil, loadErr
+	}
+
+	w := &Watcher{
+		opts:     opts,
+		dir:      filepath.Dir(opts.Path),
+		filename: filepath.Base(opts.Path),
+		current:  res,
+		stopped:  make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	// Surface the (non-fatal) validation error so the caller can decide
+	// whether to abort. Returning both lets the CLI's `validate`
+	// subcommand display the LoadResult while still reporting non-zero.
+	return w, loadErr
+}
+
+// Start begins the watch loop. It returns once the underlying fsnotify
+// watcher has been created and the watch goroutine is running. Start is
+// safe to call exactly once; subsequent calls return an error.
+func (w *Watcher) Start(ctx context.Context) error {
+	w.mu.Lock()
+	if w.started {
+		w.mu.Unlock()
+		return errors.New("harness: watcher already started")
+	}
+	fs, err := fsnotify.NewWatcher()
+	if err != nil {
+		w.mu.Unlock()
+		return fmt.Errorf("harness: create fsnotify watcher: %w", err)
+	}
+	if aerr := fs.Add(w.dir); aerr != nil {
+		_ = fs.Close()
+		w.mu.Unlock()
+		return fmt.Errorf("harness: watch dir %q: %w", w.dir, aerr)
+	}
+	w.fs = fs
+	w.started = true
+	w.mu.Unlock()
+
+	go w.run(ctx)
+	return nil
+}
+
+// Current returns the most recent successful LoadResult, or the result
+// captured at NewWatcher time if no reload has succeeded since.
+func (w *Watcher) Current() LoadResult {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	return w.current
+}
+
+// Close stops the watcher and releases its OS resources. It is safe to
+// call multiple times, and safe to call when Start was never invoked.
+func (w *Watcher) Close() error {
+	var err error
+	w.stopOnce.Do(func() {
+		w.mu.RLock()
+		started := w.started
+		w.mu.RUnlock()
+
+		close(w.stopped)
+		if started {
+			<-w.done
 		}
-	}()
+		if w.fs != nil {
+			err = w.fs.Close()
+		}
+	})
+	if err != nil {
+		return fmt.Errorf("harness: close fsnotify: %w", err)
+	}
+	return nil
+}
+
+// run is the watcher's event loop. It runs until ctx is cancelled, Close
+// is called, or fsnotify returns a fatal error on its event channel.
+func (w *Watcher) run(ctx context.Context) {
+	defer close(w.done)
+
+	var (
+		debounceTimer *time.Timer
+		debounceC     <-chan time.Time
+	)
+	resetDebounce := func() {
+		if debounceTimer == nil {
+			debounceTimer = time.NewTimer(w.opts.Debounce)
+		} else {
+			if !debounceTimer.Stop() {
+				select {
+				case <-debounceTimer.C:
+				default:
+				}
+			}
+			debounceTimer.Reset(w.opts.Debounce)
+		}
+		debounceC = debounceTimer.C
+	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
-		case err, ok := <-fsw.Errors:
+			return
+		case <-w.stopped:
+			return
+		case ev, ok := <-w.fs.Events:
 			if !ok {
-				return nil
+				return
 			}
-			w.log.Warn().Err(err).Msg("harness watcher error")
-		case evt, ok := <-fsw.Events:
-			if !ok {
-				return nil
-			}
-			if filepath.Base(evt.Name) != base {
+			if !w.eventConcernsHarness(ev) {
 				continue
 			}
-			// Coalesce: reset the debounce window on every event.
-			if debounceTimer != nil {
-				debounceTimer.Stop()
+			resetDebounce()
+		case err, ok := <-w.fs.Errors:
+			if !ok {
+				return
 			}
-			debounceTimer = time.AfterFunc(w.debounce, func() {
-				w.reloadOnce(ctx)
-			})
+			w.opts.Logger.Warn().Err(err).Msg("fsnotify reported an error")
+		case <-debounceC:
+			debounceC = nil
+			w.reload(ctx)
 		}
 	}
 }
 
-// reloadOnce performs one debounced reload: re-parse + re-validate.
-// Success → swap the live pointer, emit ConfigReloaded. Failure → leave
-// the live pointer untouched, emit ConfigReloadFailed. Either way, the
-// audit event is best-effort — sink failures are logged, not propagated.
-func (w *Watcher) reloadOnce(ctx context.Context) {
-	def, err := Parse(w.path)
+// eventConcernsHarness reports whether ev names the watched HARNESS.md.
+// Watching the parent directory is safer than watching the file directly
+// (atomic-replace saves on Windows / Linux drop the file watch); we filter
+// here so unrelated files in the same directory don't trigger reloads.
+func (w *Watcher) eventConcernsHarness(ev fsnotify.Event) bool {
+	if filepath.Base(ev.Name) != w.filename {
+		return false
+	}
+	// Chmod-only events are noise on some filesystems and never reflect
+	// content changes; ignore them to keep the audit log quiet.
+	if ev.Op == fsnotify.Chmod {
+		return false
+	}
+	return true
+}
+
+// reload re-runs Load, swaps the result on success, and emits the
+// appropriate audit event. Validation failures emit ConfigReloadFailed but
+// keep the last known good result in place.
+func (w *Watcher) reload(ctx context.Context) {
+	res, err := Load(w.opts.Path, w.opts.LoadOpts)
+
 	if err != nil {
-		w.emitFailed(ctx, err)
+		w.emitFailure(ctx, err)
 		return
 	}
 
-	cfgPtr := w.cfg.Load()
-	var cfg config.Config
-	if cfgPtr != nil {
-		cfg = *cfgPtr
-	}
-	if err := Validate(def, cfg); err != nil {
-		w.emitFailed(ctx, err)
-		return
-	}
+	w.mu.Lock()
+	w.current = res
+	w.mu.Unlock()
 
-	w.live.Store(def)
-	w.emitReloaded(ctx, def)
+	w.emitSuccess(ctx, res)
+
+	if w.opts.OnUpdate != nil {
+		w.opts.OnUpdate(res)
+	}
 }
 
-func (w *Watcher) emitReloaded(ctx context.Context, def *Definition) {
-	templates := make([]string, 0, len(def.PromptTemplates))
-	for name := range def.PromptTemplates {
-		templates = append(templates, name)
-	}
-	sort.Strings(templates)
+// emitSuccess writes a ConfigReloaded audit event and a structured info
+// log line. The payload mirrors the SPEC §17.2 event registry.
+func (w *Watcher) emitSuccess(ctx context.Context, res LoadResult) {
+	w.opts.Logger.Info().
+		Str("path", w.opts.Path).
+		Bool("validation_errors", res.Validation.HasErrors()).
+		Msg("HARNESS.md reloaded")
 
-	payload := map[string]any{
-		"path":      w.path,
-		"templates": templates,
-	}
-	if cfgPtr := w.cfg.Load(); cfgPtr != nil {
-		payload["project_id"] = cfgPtr.Project.ID
-	}
-
-	evt := AuditEvent{
-		EventType: string(eventConfigReloaded),
-		Payload:   payload,
-	}
-	if cfgPtr := w.cfg.Load(); cfgPtr != nil {
-		evt.ProjectID = cfgPtr.Project.ID
-	}
-
-	if err := w.writer.Write(ctx, evt); err != nil {
-		w.log.Warn().Err(err).Msg("emit ConfigReloaded failed")
+	if w.opts.Audit == nil {
 		return
 	}
-	w.log.Info().
-		Str("event_type", evt.EventType).
-		Strs("templates", templates).
-		Str("path", w.path).
-		Msg("harness reloaded")
+	if err := w.opts.Audit.Write(ctx, audit.AuditEvent{
+		ProjectID: res.Config.Project.ID,
+		EventType: audit.EventConfigReloaded,
+		Payload: map[string]any{
+			"path":              w.opts.Path,
+			"validation_errors": len(res.Validation.Issues),
+			"prompt_roles":      promptRoleList(res.Definition),
+		},
+	}); err != nil {
+		w.opts.Logger.Error().Err(err).Msg("audit write failed")
+	}
 }
 
-func (w *Watcher) emitFailed(ctx context.Context, err error) {
-	code := classifyAuditErrorCode(err)
-	payload := map[string]any{
-		"path":          w.path,
-		"error_code":    code,
-		"error_message": err.Error(),
-	}
-	evt := AuditEvent{
-		EventType: string(eventConfigReloadFailed),
-		Payload:   payload,
-	}
-	if cfgPtr := w.cfg.Load(); cfgPtr != nil {
-		evt.ProjectID = cfgPtr.Project.ID
-	}
-	if wErr := w.writer.Write(ctx, evt); wErr != nil {
-		w.log.Warn().Err(wErr).Msg("emit ConfigReloadFailed failed")
-	}
-	w.log.Warn().
+// emitFailure writes a ConfigReloadFailed audit event when a reload throws
+// any error path — parse, decode, $VAR expansion, validation. The previous
+// good LoadResult stays installed so the orchestrator keeps running with
+// the last known good config.
+func (w *Watcher) emitFailure(ctx context.Context, err error) {
+	w.opts.Logger.Warn().
 		Err(err).
-		Str("event_type", evt.EventType).
-		Str("error_code", code).
-		Str("path", w.path).
-		Msg("harness reload failed; keeping last known good")
+		Str("path", w.opts.Path).
+		Msg("HARNESS.md reload failed; keeping last known good config")
+
+	if w.opts.Audit == nil {
+		return
+	}
+	cur := w.Current()
+	projectID := ""
+	if cur.Definition != nil {
+		projectID = cur.Config.Project.ID
+	}
+	if werr := w.opts.Audit.Write(ctx, audit.AuditEvent{
+		ProjectID: projectID,
+		EventType: audit.EventConfigReloadFailed,
+		Payload: map[string]any{
+			"path":  w.opts.Path,
+			"error": err.Error(),
+		},
+	}); werr != nil {
+		w.opts.Logger.Error().Err(werr).Msg("audit write failed")
+	}
 }
 
-// classifyAuditErrorCode picks the SPEC §23 identifier closest to the
-// underlying error. Falls back to "harness_reload_failed" for anything
-// unrecognized so audit consumers always see a stable code.
-func classifyAuditErrorCode(err error) string {
-	switch {
-	case errors.Is(err, ErrMissingHarnessFile):
-		return ErrMissingHarnessFile.Error()
-	case errors.Is(err, ErrHarnessFrontMatterShape):
-		return ErrHarnessFrontMatterShape.Error()
-	case errors.Is(err, ErrHarnessParse):
-		return ErrHarnessParse.Error()
-	case errors.Is(err, ErrTemplateParse):
-		return ErrTemplateParse.Error()
-	case errors.Is(err, ErrTemplateRender):
-		return ErrTemplateRender.Error()
+// promptRoleList returns the role names from a Definition in deterministic
+// order so audit payloads are stable across runs.
+func promptRoleList(def *Definition) []string {
+	if def == nil {
+		return nil
 	}
-	return "harness_reload_failed"
+	roles := make([]string, 0, len(def.PromptTemplates))
+	for r := range def.PromptTemplates {
+		roles = append(roles, r)
+	}
+	// Sort to keep audit payloads deterministic. We intentionally avoid
+	// sort.Strings here so the package keeps a single sort dependency
+	// surface; Go map iteration plus a manual insertion is fine for a
+	// list that is never larger than the role registry.
+	for i := 1; i < len(roles); i++ {
+		for j := i; j > 0 && roles[j-1] > roles[j]; j-- {
+			roles[j-1], roles[j] = roles[j], roles[j-1]
+		}
+	}
+	return roles
+}
+
+// EnsureExists returns ErrMissingHarnessFile when path does not resolve to
+// an existing regular file. Callers that want to fail fast at startup can
+// use this before constructing a Watcher.
+func EnsureExists(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %s", ErrMissingHarnessFile, path)
+		}
+		return fmt.Errorf("harness: stat %q: %w", path, err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("%w: %s is a directory, expected a file", ErrMissingHarnessFile, path)
+	}
+	return nil
 }

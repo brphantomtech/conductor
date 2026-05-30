@@ -1,4 +1,4 @@
-package harness
+package harness_test
 
 import (
 	"errors"
@@ -7,233 +7,143 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/conductor-sh/conductor/internal/config"
-	"github.com/conductor-sh/conductor/internal/provider"
-	"github.com/conductor-sh/conductor/internal/tracker"
+	"github.com/conductor-sh/conductor/internal/harness"
 )
 
-// validCfg returns a Config that passes Validate. Tests start from this
-// and zero specific fields to trigger one rule at a time.
-func validCfg() config.Config {
-	return config.Config{
-		Project: config.Project{ID: "demo"},
-		Tracker: config.Tracker{
-			Kind:        "linear",
-			APIKey:      "secret",
-			ProjectSlug: "team",
-		},
-		Providers: config.Providers{
-			Default: config.ProviderConfig{
-				Provider: "anthropic",
-				APIKey:   "k",
-			},
-		},
-		Knowledge: config.Knowledge{StoreBackend: "sqlite_vec"},
-		Memory:    config.Memory{StoreBackend: "sqlite"},
-		Routing:   config.Routing{Pipeline: []string{"planner", "coder", "verifier"}},
-	}
+func newCfg(pipeline []string, rules ...config.RoutingRule) config.Config {
+	cfg := config.Defaults()
+	cfg.Routing.Pipeline = pipeline
+	cfg.Routing.Rules = rules
+	return cfg
 }
 
-// validDef returns a Definition with templates matching validCfg's
-// pipeline.
-func validDef() *Definition {
-	return &Definition{
-		FrontMatter: map[string]any{},
+func TestValidate_PassesCleanDefinition(t *testing.T) {
+	t.Parallel()
+
+	def := &harness.Definition{
 		PromptTemplates: map[string]string{
-			"planner":  "{{ issue.identifier }} plan",
-			"coder":    "code",
-			"verifier": "verify",
+			"planner":  "Plan {{ issue.identifier }}.",
+			"coder":    "Implement {{ issue.title }}.",
+			"verifier": "Verify {{ issue.identifier }}.",
 		},
 	}
+	cfg := newCfg([]string{"planner", "coder", "verifier"})
+
+	res, err := harness.Validate(def, cfg)
+	require.NoError(t, err)
+	require.False(t, res.HasErrors())
 }
 
-func TestValidate_CleanCaseReturnsNil(t *testing.T) {
-	require.NoError(t, Validate(validDef(), validCfg()))
-}
+func TestValidate_DetectsMissingPipelineRole(t *testing.T) {
+	t.Parallel()
 
-func TestValidate_MissingProjectIDIsReported(t *testing.T) {
-	cfg := validCfg()
-	cfg.Project.ID = ""
-
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrProjectIDMissing))
-}
-
-func TestValidate_MissingTrackerAPIKeyIsReported(t *testing.T) {
-	cfg := validCfg()
-	cfg.Tracker.APIKey = ""
-
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrTrackerAPIKeyMissing))
-}
-
-func TestValidate_UnsupportedTrackerKindIsReported(t *testing.T) {
-	cfg := validCfg()
-	cfg.Tracker.Kind = "redmine"
-
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrTrackerKindUnsupported))
-}
-
-func TestValidate_UnsupportedProviderIsReported(t *testing.T) {
-	cfg := validCfg()
-	cfg.Providers.Default.Provider = "claude2"
-
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrProviderUnsupported))
-}
-
-func TestValidate_MissingProviderAPIKeyForHostedProviderIsReported(t *testing.T) {
-	cfg := validCfg()
-	cfg.Providers.Default.APIKey = ""
-
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrProviderAPIKeyMissing))
-}
-
-func TestValidate_OllamaWithoutAPIKeyIsAccepted(t *testing.T) {
-	cfg := validCfg()
-	cfg.Providers.Default.Provider = "ollama"
-	cfg.Providers.Default.APIKey = ""
-
-	require.NoError(t, Validate(validDef(), cfg))
-}
-
-func TestValidate_MultipleProblemsAreJoined(t *testing.T) {
-	cfg := validCfg()
-	cfg.Tracker.APIKey = ""
-	cfg.Providers.Default.Provider = "made_up_thing"
-
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrTrackerAPIKeyMissing))
-	require.True(t, errors.Is(err, ErrProviderUnsupported))
-}
-
-func TestValidate_PipelineRoleWithoutTemplateIsReported(t *testing.T) {
-	cfg := validCfg()
-	cfg.Routing.Pipeline = []string{"planner", "coder", "verifier", "reviewer"}
-
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrPipelineRoleMissingTemplate))
-}
-
-func TestValidate_RoutingRulePipelineRoleWithoutTemplateIsReported(t *testing.T) {
-	cfg := validCfg()
-	cfg.Routing.Rules = []config.RoutingRule{
-		{
-			When:     config.RoutingMatch{TaskType: "bug"},
-			Pipeline: []string{"planner", "coder", "reviewer"},
+	def := &harness.Definition{
+		PromptTemplates: map[string]string{
+			"coder": "Implement {{ issue.title }}.",
 		},
 	}
+	cfg := newCfg([]string{"planner", "coder"})
 
-	err := Validate(validDef(), cfg)
+	res, err := harness.Validate(def, cfg)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrPipelineRoleMissingTemplate))
-}
+	require.True(t, res.HasErrors())
+	require.True(t, errors.Is(err, harness.ErrHarnessParse),
+		"missing pipeline role must classify as ErrHarnessParse, got %v", err)
 
-func TestValidate_TrackerNeedsProjectRef(t *testing.T) {
-	cfg := validCfg()
-	cfg.Tracker.ProjectSlug = ""
-	cfg.Tracker.ProjectID = ""
-
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrTrackerProjectRefMissing))
-}
-
-// TestValidate_DelegatesToProviderValidate confirms that the harness
-// validator surfaces SPEC §23.3 sentinels through the joined error
-// alongside the existing harness sub-class sentinels — checks that a
-// `custom`-without-`base_url` configuration is flagged via
-// provider.ErrUnsupportedProvider even though it slips past the
-// harness-side provider rules.
-func TestValidate_DelegatesToProviderValidate(t *testing.T) {
-	cfg := validCfg()
-	cfg.Providers.Default.Provider = "custom"
-	cfg.Providers.Default.APIKey = "k"
-	cfg.Providers.Default.BaseURL = "" // required for custom
-
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, provider.ErrUnsupportedProvider))
-	require.Contains(t, err.Error(), "base_url")
-}
-
-// TestValidate_DelegatesToTrackerValidate confirms that the harness
-// validator surfaces SPEC §23.2 sentinels through the joined error
-// alongside the existing harness sub-class sentinels. The harness's
-// own `supportedTrackerKinds` map covers the "redmine" case from
-// TestValidate_UnsupportedTrackerKindIsReported, but the SPEC §23.2
-// `tracker.ErrUnsupportedKind` sentinel only reaches the error chain
-// via the tracker.Validate delegation.
-func TestValidate_DelegatesToTrackerValidate(t *testing.T) {
-	cfg := validCfg()
-	cfg.Tracker.Kind = "made-up-tracker"
-
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, tracker.ErrUnsupportedKind),
-		"joined error must surface tracker.ErrUnsupportedKind from delegation")
-}
-
-// TestValidate_ProviderRoleOverrideIsValidated confirms that a per-role
-// override missing an api_key is flagged via the SPEC §23.3 sentinel
-// the provider package surfaces.
-func TestValidate_ProviderRoleOverrideIsValidated(t *testing.T) {
-	cfg := validCfg()
-	cfg.Providers.Roles = map[string]config.ProviderConfig{
-		"coder": {Provider: "openai", Model: "x", APIKey: ""},
+	roles := []string{}
+	for _, iss := range res.Issues {
+		roles = append(roles, iss.Role)
 	}
-	err := Validate(validDef(), cfg)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, provider.ErrMissingAPIKey))
+	require.Contains(t, roles, "planner",
+		"validator must report the missing role explicitly")
 }
 
-func TestValidate_BadTemplateIsReported(t *testing.T) {
-	cfg := validCfg()
-	def := validDef()
-	// Empty expression is rejected at parse time by osteele/liquid.
-	def.PromptTemplates["coder"] = "{{ }}"
+func TestValidate_DetectsMissingRoleFromRoutingRule(t *testing.T) {
+	t.Parallel()
 
-	err := Validate(def, cfg)
+	def := &harness.Definition{
+		PromptTemplates: map[string]string{
+			"coder": "Implement {{ issue.title }}.",
+		},
+	}
+	cfg := newCfg(
+		[]string{"coder"},
+		config.RoutingRule{Pipeline: []string{"gc_agent"}},
+	)
+
+	res, err := harness.Validate(def, cfg)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrTemplateParse))
+	require.True(t, errors.Is(err, harness.ErrHarnessParse))
+
+	roles := map[string]bool{}
+	for _, iss := range res.Issues {
+		roles[iss.Role] = true
+	}
+	require.True(t, roles["gc_agent"],
+		"roles referenced via routing.rules[].pipeline must also be checked")
 }
 
-func TestValidate_UnsupportedKnowledgeBackend(t *testing.T) {
-	cfg := validCfg()
-	cfg.Knowledge.StoreBackend = "chromadb"
+func TestValidate_FailsOnTemplateSyntaxError(t *testing.T) {
+	t.Parallel()
 
-	err := Validate(validDef(), cfg)
+	def := &harness.Definition{
+		PromptTemplates: map[string]string{
+			"coder": "{% if foo %}no end tag",
+		},
+	}
+	cfg := newCfg([]string{"coder"})
+
+	res, err := harness.Validate(def, cfg)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrKnowledgeBackendUnsupported))
+	require.True(t, errors.Is(err, harness.ErrTemplateParse),
+		"unterminated tag must classify as ErrTemplateParse, got %v", err)
+	require.NotEmpty(t, res.Issues)
 }
 
-func TestValidate_UnsupportedMemoryBackend(t *testing.T) {
-	cfg := validCfg()
-	cfg.Memory.StoreBackend = "mongodb"
+func TestValidate_FailsOnUnknownVariable(t *testing.T) {
+	t.Parallel()
 
-	err := Validate(validDef(), cfg)
+	def := &harness.Definition{
+		PromptTemplates: map[string]string{
+			"coder": "Look at {{ totally_unknown_variable }}",
+		},
+	}
+	cfg := newCfg([]string{"coder"})
+
+	res, err := harness.Validate(def, cfg)
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrMemoryBackendUnsupported))
+	require.True(t, errors.Is(err, harness.ErrTemplateRender),
+		"unknown variable surfaced via mock-binding render must classify as ErrTemplateRender, got %v", err)
+	require.NotEmpty(t, res.Issues)
 }
 
-func TestValidate_UnsupportedDocStoreBackend(t *testing.T) {
-	cfg := validCfg()
-	cfg.Docs.Stores = []config.DocStoreConfig{{ID: "x", Backend: "dropbox"}}
+func TestValidate_NilDefinitionFailsFast(t *testing.T) {
+	t.Parallel()
 
-	err := Validate(validDef(), cfg)
+	_, err := harness.Validate(nil, config.Defaults())
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrDocStoreBackendUnsupported))
+	require.True(t, errors.Is(err, harness.ErrHarnessParse))
 }
 
-func TestValidate_NilDefinitionIsAnError(t *testing.T) {
-	err := Validate(nil, validCfg())
+func TestValidate_DeduplicatesMissingRoleAcrossRules(t *testing.T) {
+	t.Parallel()
+
+	def := &harness.Definition{PromptTemplates: map[string]string{"coder": "Hi."}}
+	cfg := newCfg(
+		[]string{"coder", "ghost"},
+		config.RoutingRule{Pipeline: []string{"ghost", "ghost"}},
+		config.RoutingRule{Pipeline: []string{"ghost"}},
+	)
+
+	res, err := harness.Validate(def, cfg)
 	require.Error(t, err)
+
+	count := 0
+	for _, iss := range res.Issues {
+		if iss.Role == "ghost" {
+			count++
+		}
+	}
+	require.Equal(t, 1, count,
+		"ghost role must be reported exactly once even when referenced multiple times")
 }

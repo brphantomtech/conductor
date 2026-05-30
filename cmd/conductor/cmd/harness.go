@@ -1,7 +1,7 @@
 package cmd
 
 import (
-	"errors"
+	"encoding/json"
 	"fmt"
 	"io"
 	"sort"
@@ -9,12 +9,21 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/conductor-sh/conductor/internal/config"
 	"github.com/conductor-sh/conductor/internal/harness"
 )
 
-// newHarnessCommand wires the `conductor harness ...` parent command.
-// `validate` is the only subcommand wired in Phase 2; `check` and
-// `reload` land later (Phase 12 + Phase 14).
+// outputFormatText emits human-readable lines; outputFormatJSON emits a
+// single JSON object so downstream tooling (CI gates, IDE extensions) can
+// parse the report without scraping text.
+const (
+	outputFormatText = "text"
+	outputFormatJSON = "json"
+)
+
+// newHarnessCommand wires the `conductor harness ...` parent command. The
+// only subcommand active in Phase 2 is `validate`; `check` arrives in
+// Phase 12.
 func newHarnessCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "harness",
@@ -24,172 +33,208 @@ func newHarnessCommand() *cobra.Command {
 	return cmd
 }
 
-// newHarnessValidateCommand returns the Phase 2 `harness validate` command:
-// it resolves the path per SPEC §5.1, parses HARNESS.md per §5.2, merges
-// config per §6.1, runs schema validation per §6.4, and prints a
-// categorized error list to stderr if anything fails.
+// validateFlags carries the CLI options for `conductor harness validate`.
+// Path is positional or `--harness`; Format selects text vs JSON output.
+type validateFlags struct {
+	path   string
+	format string
+}
+
 func newHarnessValidateCommand() *cobra.Command {
-	var harnessPath string
+	flags := &validateFlags{}
 	cmd := &cobra.Command{
 		Use:   "validate [path]",
 		Short: "Validate a HARNESS.md file without starting the service",
-		Long: "Validate the structural integrity, schema, and template " +
-			"syntax of a HARNESS.md file. Resolves the path using the " +
-			"SPEC §5.1 precedence (flag > env > cwd > doc store), parses " +
-			"the file, merges defaults + env vars, and reports every " +
-			"problem at once.",
+		Long: "Parse HARNESS.md, decode its YAML front matter into the typed " +
+			"config, and dry-render every prompt template against the SPEC §16.2 " +
+			"mock bindings. Exits non-zero when the parser, config decoder, or " +
+			"template validator reports an issue.",
 		Args: cobra.MaximumNArgs(1),
 		// runHarnessValidate emits its own categorized stderr output; we
 		// silence Cobra's default "Error: ..." line so each underlying
 		// problem is only printed once.
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			target := harnessPath
+			// A positional path overrides --harness; either then takes
+			// precedence over $CONDUCTOR_HARNESS_PATH and the cwd default
+			// per SPEC §5.1 discovery order.
+			explicit := flags.path
 			if len(args) == 1 {
-				target = args[0]
+				explicit = args[0]
 			}
-			return runHarnessValidate(cmd.OutOrStdout(), cmd.ErrOrStderr(), target)
+			target := harness.ResolvePath(explicit, nil)
+			return runHarnessValidate(cmd.OutOrStdout(), target, flags.format)
 		},
 	}
-	cmd.Flags().StringVar(&harnessPath, "harness", "",
-		"path to HARNESS.md (overrides --harness on the parent command)")
+	cmd.Flags().StringVar(&flags.path, "harness", "",
+		"path to HARNESS.md (default: ./HARNESS.md)")
+	cmd.Flags().StringVar(&flags.format, "format", outputFormatText,
+		"output format (text, json)")
 	return cmd
 }
 
-// runHarnessValidate is the testable core of `harness validate`. It
-// returns the same error the Cobra RunE would, so tests can assert on
-// the returned error type *and* on the bytes written to stderr.
-func runHarnessValidate(stdout, stderr io.Writer, target string) error {
-	res, err := harness.Load(harness.LoadOptions{Flag: target})
-	if err != nil {
-		printValidationErrors(stderr, res.Path, err)
-		return errSilentExit{err: err}
+// validateReport is the structured payload `harness validate` writes to
+// stdout. It is shared by both output formats so JSON consumers and humans
+// see the same fields.
+type validateReport struct {
+	Path       string                `json:"path"`
+	OK         bool                  `json:"ok"`
+	ParseError string                `json:"parse_error,omitempty"`
+	Roles      []string              `json:"roles,omitempty"`
+	Issues     []validateReportIssue `json:"issues,omitempty"`
+}
+
+// validateReportIssue mirrors harness.ValidationIssue but with a stable
+// JSON shape (Sentinel emitted as the SPEC string identifier rather than
+// the Go error pointer).
+type validateReportIssue struct {
+	Sentinel string `json:"sentinel"`
+	Role     string `json:"role,omitempty"`
+	Message  string `json:"message"`
+}
+
+// runHarnessValidate is the top-level executor for the subcommand. It loads
+// the harness, builds a structured report, prints it, and returns an error
+// when the load surfaced one (so cobra propagates a non-zero exit code).
+func runHarnessValidate(out io.Writer, path, format string) error {
+	if format != outputFormatText && format != outputFormatJSON {
+		return fmt.Errorf("harness validate: unsupported --format %q (want text or json)", format)
 	}
 
-	tmpls := make([]string, 0, len(res.Definition.PromptTemplates))
-	for name := range res.Definition.PromptTemplates {
-		tmpls = append(tmpls, name)
-	}
-	sort.Strings(tmpls)
+	res, loadErr := harness.Load(path, config.LoadOptions{})
 
-	_, werr := fmt.Fprintf(stdout, "OK: %s (front matter %d keys, %d templates [%s])\n",
-		res.Path, len(res.Definition.FrontMatter), len(tmpls), strings.Join(tmpls, ", "),
-	)
-	if werr != nil {
-		return fmt.Errorf("harness validate: write: %w", werr)
+	rep := buildReport(path, res, loadErr)
+
+	if err := writeReport(out, rep, format); err != nil {
+		return err
+	}
+	if loadErr != nil {
+		// Wrap so cobra exits non-zero with context; %w keeps the SPEC
+		// sentinel recoverable via errors.Is for callers and tests.
+		return fmt.Errorf("harness validate: %w", loadErr)
 	}
 	return nil
 }
 
-// ErrSilent is the sentinel returned by subcommands that have already
-// printed their own structured error output. main.go uses errors.Is to
-// detect it and skip the default "Error: <msg>" line; Cobra is
-// SilenceErrors-on at the same time so the only side effect is a
-// non-zero exit code.
-var ErrSilent = errors.New("conductor: silent error already reported")
+// buildReport translates a (LoadResult, error) pair into the wire-shaped
+// report. Parse-time failures populate ParseError; validation findings fill
+// Issues. Success populates Roles so the operator can confirm at a glance
+// which `## <role>` sections were extracted.
+func buildReport(path string, res harness.LoadResult, loadErr error) validateReport {
+	rep := validateReport{Path: path}
 
-// errSilentExit wraps a real error with ErrSilent so callers can still
-// inspect the underlying problem (via errors.Is / errors.As) while the
-// runtime treats the failure as already-reported.
-type errSilentExit struct{ err error }
-
-func (e errSilentExit) Error() string { return e.err.Error() }
-func (e errSilentExit) Unwrap() []error {
-	return []error{e.err, ErrSilent}
+	switch {
+	case loadErr != nil && res.Definition == nil:
+		rep.ParseError = loadErr.Error()
+	case loadErr != nil:
+		rep.Issues = collectIssues(res.Validation.Issues)
+		rep.Roles = sortedRoles(res.Definition)
+	default:
+		rep.OK = true
+		rep.Roles = sortedRoles(res.Definition)
+	}
+	return rep
 }
 
-// printValidationErrors expands an `errors.Join`-style error into one
-// classified line per underlying problem. Categories are sorted so the
-// operator always sees the same ordering for the same input.
-func printValidationErrors(w io.Writer, path string, err error) {
-	if path != "" {
-		fmt.Fprintf(w, "harness validate: %s\n", path)
-	}
-
-	type classifiedErr struct {
-		code     string
-		category int
-		message  string
-	}
-	var rows []classifiedErr
-
-	for _, sub := range flatten(err) {
-		code, cat := classifyError(sub)
-		rows = append(rows, classifiedErr{
-			code:     code,
-			category: cat,
-			message:  sub.Error(),
-		})
-	}
-
-	sort.SliceStable(rows, func(i, j int) bool {
-		if rows[i].category != rows[j].category {
-			return rows[i].category < rows[j].category
-		}
-		return rows[i].code < rows[j].code
-	})
-
-	for _, r := range rows {
-		fmt.Fprintf(w, "  [%s] %s\n", r.code, r.message)
-	}
-}
-
-// flatten walks an arbitrarily nested errors.Join tree and returns the
-// leaf errors in their original order.
-func flatten(err error) []error {
-	if err == nil {
+// collectIssues converts harness.ValidationIssues to the wire shape. The
+// sentinel field carries the SPEC §23.1 string so the output matches the
+// audit-event identifiers operators are already familiar with.
+func collectIssues(in []harness.ValidationIssue) []validateReportIssue {
+	if len(in) == 0 {
 		return nil
 	}
-	type unwrapMany interface{ Unwrap() []error }
-	if u, ok := err.(unwrapMany); ok {
-		var out []error
-		for _, sub := range u.Unwrap() {
-			out = append(out, flatten(sub)...)
-		}
-		if len(out) == 0 {
-			return []error{err}
-		}
-		return out
+	out := make([]validateReportIssue, 0, len(in))
+	for _, iss := range in {
+		out = append(out, validateReportIssue{
+			Sentinel: sentinelString(iss.Sentinel),
+			Role:     iss.Role,
+			Message:  iss.Message,
+		})
 	}
-	return []error{err}
+	return out
 }
 
-// classifyError maps an error to (code, category) where category orders
-// output: file (1) → parse (2) → schema (3) → templates (4) → other (5).
-func classifyError(err error) (string, int) {
-	switch {
-	case errors.Is(err, harness.ErrMissingHarnessFile):
-		return harness.ErrMissingHarnessFile.Error(), 1
-	case errors.Is(err, harness.ErrHarnessFrontMatterShape):
-		return harness.ErrHarnessFrontMatterShape.Error(), 2
-	case errors.Is(err, harness.ErrHarnessParse):
-		return harness.ErrHarnessParse.Error(), 2
-	case errors.Is(err, harness.ErrTemplateParse):
-		return harness.ErrTemplateParse.Error(), 4
-	case errors.Is(err, harness.ErrTemplateRender):
-		return harness.ErrTemplateRender.Error(), 4
-	case errors.Is(err, harness.ErrPipelineRoleMissingTemplate):
-		return harness.ErrPipelineRoleMissingTemplate.Error(), 4
-	case errors.Is(err, harness.ErrProjectIDMissing):
-		return harness.ErrProjectIDMissing.Error(), 3
-	case errors.Is(err, harness.ErrTrackerKindMissing):
-		return harness.ErrTrackerKindMissing.Error(), 3
-	case errors.Is(err, harness.ErrTrackerKindUnsupported):
-		return harness.ErrTrackerKindUnsupported.Error(), 3
-	case errors.Is(err, harness.ErrTrackerAPIKeyMissing):
-		return harness.ErrTrackerAPIKeyMissing.Error(), 3
-	case errors.Is(err, harness.ErrTrackerProjectRefMissing):
-		return harness.ErrTrackerProjectRefMissing.Error(), 3
-	case errors.Is(err, harness.ErrProviderUnsupported):
-		return harness.ErrProviderUnsupported.Error(), 3
-	case errors.Is(err, harness.ErrProviderAPIKeyMissing):
-		return harness.ErrProviderAPIKeyMissing.Error(), 3
-	case errors.Is(err, harness.ErrKnowledgeBackendUnsupported):
-		return harness.ErrKnowledgeBackendUnsupported.Error(), 3
-	case errors.Is(err, harness.ErrMemoryBackendUnsupported):
-		return harness.ErrMemoryBackendUnsupported.Error(), 3
-	case errors.Is(err, harness.ErrDocStoreBackendUnsupported):
-		return harness.ErrDocStoreBackendUnsupported.Error(), 3
+// sentinelString recovers the SPEC identifier from an error. Validation
+// issues always carry one of the harness sentinels, but defensive code
+// returns an empty string when the chain has been replaced.
+func sentinelString(err error) string {
+	if err == nil {
+		return ""
 	}
-	return "unclassified", 5
+	return err.Error()
+}
+
+// sortedRoles returns the prompt-template role names in alphabetical order
+// so output is deterministic across runs (Go map iteration is randomized).
+func sortedRoles(def *harness.Definition) []string {
+	if def == nil {
+		return nil
+	}
+	roles := make([]string, 0, len(def.PromptTemplates))
+	for r := range def.PromptTemplates {
+		roles = append(roles, r)
+	}
+	sort.Strings(roles)
+	return roles
+}
+
+// writeReport emits the report in the requested format. Text format prints
+// one line per finding so it greps cleanly; JSON format prints a single
+// indented object.
+func writeReport(out io.Writer, rep validateReport, format string) error {
+	if format == outputFormatJSON {
+		enc := json.NewEncoder(out)
+		enc.SetIndent("", "  ")
+		if err := enc.Encode(rep); err != nil {
+			return fmt.Errorf("harness validate: encode json: %w", err)
+		}
+		return nil
+	}
+	return writeTextReport(out, rep)
+}
+
+// writeTextReport renders the human-readable form. Each line begins with a
+// status tag (`OK`, `FAIL`, `PARSE`) so log-grep filters stay simple.
+func writeTextReport(out io.Writer, rep validateReport) error {
+	if rep.ParseError != "" {
+		_, err := fmt.Fprintf(out, "PARSE %s\n  %s\n", rep.Path, rep.ParseError)
+		if err != nil {
+			return fmt.Errorf("harness validate: write: %w", err)
+		}
+		return nil
+	}
+	if rep.OK {
+		_, err := fmt.Fprintf(out, "OK %s (%d roles: %s)\n",
+			rep.Path, len(rep.Roles), commaJoin(rep.Roles))
+		if err != nil {
+			return fmt.Errorf("harness validate: write: %w", err)
+		}
+		return nil
+	}
+	if _, err := fmt.Fprintf(out, "FAIL %s (%d issue(s))\n", rep.Path, len(rep.Issues)); err != nil {
+		return fmt.Errorf("harness validate: write: %w", err)
+	}
+	for _, iss := range rep.Issues {
+		role := iss.Role
+		if role == "" {
+			role = "<document>"
+		}
+		if _, err := fmt.Fprintf(out, "  [%s] role=%s: %s\n", iss.Sentinel, role, iss.Message); err != nil {
+			return fmt.Errorf("harness validate: write: %w", err)
+		}
+	}
+	return nil
+}
+
+// commaJoin is a tiny helper that returns "<empty>" for an empty slice so
+// the OK line stays grammatical when a harness has no `## <role>` headings.
+func commaJoin(in []string) string {
+	if len(in) == 0 {
+		return "<empty>"
+	}
+	out := in[0]
+	for _, s := range in[1:] {
+		out += ", " + s
+	}
+	return out
 }

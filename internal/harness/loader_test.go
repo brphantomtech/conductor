@@ -1,4 +1,4 @@
-package harness
+package harness_test
 
 import (
 	"errors"
@@ -6,171 +6,181 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/spf13/pflag"
 	"github.com/stretchr/testify/require"
+
+	"github.com/conductor-sh/conductor/internal/config"
+	"github.com/conductor-sh/conductor/internal/harness"
 )
 
-func writeFile(t *testing.T, dir, name, body string) string {
+// validHarnessSrc is the minimum HARNESS.md that satisfies both parser and
+// validator with the default routing pipeline {planner, coder, verifier}.
+const validHarnessSrc = `---
+project:
+  id: demo
+tracker:
+  kind: linear
+  api_key: token-xyz
+  project_slug: demo-team
+providers:
+  default:
+    provider: openrouter
+    api_key: sk-test
+---
+
+## planner
+
+Plan {{ issue.identifier }}.
+
+## coder
+
+Implement {{ issue.title }}.
+
+## verifier
+
+Verify {{ issue.identifier }}.
+`
+
+func writeHarness(t *testing.T, body string) string {
 	t.Helper()
-	p := filepath.Join(dir, name)
-	require.NoError(t, os.WriteFile(p, []byte(body), 0o644))
-	return p
+	dir := t.TempDir()
+	path := filepath.Join(dir, "HARNESS.md")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+	return path
 }
 
-const validHarnessYAML = `---
-project:
-  id: demo
-tracker:
-  kind: linear
-  api_key: secret
-  project_slug: team
-providers:
-  default:
-    provider: anthropic
-    api_key: ank
-routing:
-  pipeline: [planner, coder, verifier]
----
+func TestLoad_HappyPath(t *testing.T) {
+	t.Parallel()
 
-## planner
-
-plan
-
-## coder
-
-code
-
-## verifier
-
-verify
-`
-
-func TestLoad_EnvOnlyFlow(t *testing.T) {
-	dir := t.TempDir()
-	path := writeFile(t, dir, "HARNESS.md", validHarnessYAML)
-
-	res, err := Load(LoadOptions{
-		Env: mapEnv(map[string]string{EnvHarnessPath: path}),
-		Cwd: dir,
-	})
+	path := writeHarness(t, validHarnessSrc)
+	res, err := harness.Load(path, config.LoadOptions{})
 	require.NoError(t, err)
-	require.Equal(t, SourceEnv, res.Source)
-	require.Equal(t, path, res.Path)
-	require.Equal(t, "demo", res.Config.Project.ID)
-	require.Equal(t, "linear", res.Config.Tracker.Kind)
-	require.Contains(t, res.Definition.PromptTemplates, "coder")
-}
 
-func TestLoad_FlagFlow(t *testing.T) {
-	dir := t.TempDir()
-	path := writeFile(t, dir, "any-name.md", validHarnessYAML)
-
-	res, err := Load(LoadOptions{
-		Flag: path,
-		Env:  mapEnv(nil),
-		Cwd:  dir,
-	})
-	require.NoError(t, err)
-	require.Equal(t, SourceFlag, res.Source)
-	require.Equal(t, path, res.Path)
-}
-
-func TestLoad_ValidationFailureShortCircuits(t *testing.T) {
-	dir := t.TempDir()
-	// Missing project.id and unsupported provider.
-	body := `---
-tracker:
-  kind: linear
-  api_key: secret
-  project_slug: team
-providers:
-  default:
-    provider: nope
----
-
-## planner
-
-p
-
-## coder
-
-c
-
-## verifier
-
-v
-`
-	path := writeFile(t, dir, "HARNESS.md", body)
-
-	res, err := Load(LoadOptions{
-		Flag: path,
-		Env:  mapEnv(nil),
-		Cwd:  dir,
-	})
-	require.Error(t, err)
-	// Definition and Path should still be populated so the CLI can name
-	// the file in its error output.
 	require.NotNil(t, res.Definition)
-	require.Equal(t, path, res.Path)
-	require.True(t, errors.Is(err, ErrProjectIDMissing))
-	require.True(t, errors.Is(err, ErrProviderUnsupported))
+	require.Equal(t, path, res.Definition.Source)
+	require.Equal(t, "demo", res.Config.Project.ID)
+	require.Equal(t, "openrouter", res.Config.Providers.Default.Provider)
+	require.False(t, res.Validation.HasErrors())
 }
 
-func TestLoad_CLIFlagsOverrideFrontMatter(t *testing.T) {
-	dir := t.TempDir()
-	// Front matter sets polling.interval_ms to 5000.
-	body := `---
-project:
-  id: demo
-tracker:
-  kind: linear
-  api_key: secret
-  project_slug: team
-providers:
-  default:
-    provider: anthropic
-    api_key: ank
-routing:
-  pipeline: [planner, coder, verifier]
-polling:
-  interval_ms: 5000
+func TestLoad_MissingFile(t *testing.T) {
+	t.Parallel()
+
+	_, err := harness.Load(filepath.Join(t.TempDir(), "missing.md"), config.LoadOptions{})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, harness.ErrMissingHarnessFile))
+}
+
+func TestLoad_TemplateRenderFailure(t *testing.T) {
+	t.Parallel()
+
+	path := writeHarness(t, `---
+project: { id: demo }
 ---
-
-## planner
-
-p
 
 ## coder
 
-c
+Hello {{ totally_unknown_variable }}
+`)
 
-## verifier
-
-v
-`
-	path := writeFile(t, dir, "HARNESS.md", body)
-
-	fs := pflag.NewFlagSet("test", pflag.ContinueOnError)
-	fs.Int("polling-interval", 0, "")
-	require.NoError(t, fs.Parse([]string{"--polling-interval=1000"}))
-
-	res, err := Load(LoadOptions{
-		Flag:     path,
-		Env:      mapEnv(nil),
-		Cwd:      dir,
-		CLIFlags: fs,
-	})
-	require.NoError(t, err)
-	require.Equal(t, 1000, res.Config.Polling.IntervalMS)
+	res, err := harness.Load(path, config.LoadOptions{})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, harness.ErrTemplateRender),
+		"unknown variable must classify as ErrTemplateRender, got %v", err)
+	require.NotNil(t, res.Definition,
+		"validation failures must still return the parsed Definition for diagnostic display")
+	require.True(t, res.Validation.HasErrors())
 }
 
-func TestLoad_MissingFileReturnsMissingHarness(t *testing.T) {
-	dir := t.TempDir()
-	res, err := Load(LoadOptions{
-		Env: mapEnv(nil),
-		Cwd: dir,
-	})
+func TestLoad_PipelineRoleMissing(t *testing.T) {
+	t.Parallel()
+
+	// Default routing pipeline expects planner+coder+verifier; the
+	// harness only ships coder.
+	path := writeHarness(t, `---
+project: { id: demo }
+tracker:
+  kind: linear
+  api_key: t
+  project_slug: x
+providers:
+  default:
+    provider: openrouter
+    api_key: sk
+---
+
+## coder
+
+Implement.
+`)
+
+	res, err := harness.Load(path, config.LoadOptions{})
 	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrMissingHarnessFile))
-	require.Nil(t, res.Definition)
+	require.True(t, errors.Is(err, harness.ErrHarnessParse))
+
+	missing := map[string]bool{}
+	for _, iss := range res.Validation.Issues {
+		missing[iss.Role] = true
+	}
+	require.True(t, missing["planner"])
+	require.True(t, missing["verifier"])
+}
+
+func TestLoadBytes_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	res, err := harness.LoadBytes([]byte(validHarnessSrc), config.LoadOptions{})
+	require.NoError(t, err)
+	require.Equal(t, "", res.Definition.Source,
+		"LoadBytes must leave Source empty so callers can populate it explicitly")
+	require.Equal(t, "demo", res.Config.Project.ID)
+}
+
+func TestResolvePath_Precedence(t *testing.T) {
+	t.Parallel()
+
+	// envSet simulates $CONDUCTOR_HARNESS_PATH = "from-env" being present.
+	envSet := func(string) (string, bool) { return "from-env", true }
+	// envUnset simulates the variable being absent.
+	envUnset := func(string) (string, bool) { return "", false }
+	// envEmpty simulates the variable set to the empty string, which SPEC
+	// §5.1 treats the same as unset (fall through to the cwd default).
+	envEmpty := func(string) (string, bool) { return "", true }
+
+	t.Run("flag wins over env and default", func(t *testing.T) {
+		t.Parallel()
+		require.Equal(t, "from-flag", harness.ResolvePath("from-flag", envSet))
+	})
+
+	t.Run("env used when flag empty", func(t *testing.T) {
+		t.Parallel()
+		require.Equal(t, "from-env", harness.ResolvePath("", envSet))
+	})
+
+	t.Run("default used when flag and env empty", func(t *testing.T) {
+		t.Parallel()
+		require.Equal(t, config.DefaultHarnessPath, harness.ResolvePath("", envUnset))
+		require.Equal(t, config.DefaultHarnessPath, harness.ResolvePath("", envEmpty))
+	})
+}
+
+func TestLoad_FrontMatterOverridesDefaults(t *testing.T) {
+	t.Parallel()
+
+	path := writeHarness(t, `---
+project: { id: demo }
+polling:
+  interval_ms: 1234
+---
+
+## coder
+
+Hi.
+`)
+
+	// Validation will report missing planner/verifier templates against the
+	// default pipeline, but the typed Config still decodes; the test cares
+	// only that front-matter precedence is honored end-to-end.
+	res, _ := harness.Load(path, config.LoadOptions{})
+	require.Equal(t, 1234, res.Config.Polling.IntervalMS,
+		"front matter values must flow through into the typed Config (SPEC §6.1)")
 }

@@ -2,156 +2,131 @@ package cmd
 
 import (
 	"bytes"
-	"errors"
+	"encoding/json"
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-
-	"github.com/conductor-sh/conductor/internal/harness"
 )
 
-const goodHarness = `---
+// validHarness satisfies the parser, the config decoder, and the validator
+// against the default routing pipeline {planner, coder, verifier}.
+const validHarness = `---
 project:
   id: demo
 tracker:
   kind: linear
-  api_key: secret
-  project_slug: team
+  api_key: token-xyz
+  project_slug: demo-team
 providers:
   default:
-    provider: anthropic
-    api_key: ank
-routing:
-  pipeline: [planner, coder, verifier]
+    provider: openrouter
+    api_key: sk-test
 ---
 
 ## planner
 
-p
+Plan {{ issue.identifier }}.
 
 ## coder
 
-c
+Implement {{ issue.title }}.
 
 ## verifier
 
-v
+Verify {{ issue.identifier }}.
 `
 
-func writeTempHarness(t *testing.T, body string) string {
+func writeHarnessFile(t *testing.T, body string) string {
 	t.Helper()
-	dir := t.TempDir()
-	p := filepath.Join(dir, "HARNESS.md")
-	require.NoError(t, os.WriteFile(p, []byte(body), 0o644))
-	return p
+	path := filepath.Join(t.TempDir(), "HARNESS.md")
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+	return path
 }
 
-func TestRunHarnessValidate_MissingFile(t *testing.T) {
-	dir := t.TempDir()
-	missing := filepath.Join(dir, "does-not-exist.md")
-
+func runValidate(t *testing.T, args ...string) (string, string, error) {
+	t.Helper()
+	root := NewRootCommand()
 	var stdout, stderr bytes.Buffer
-	err := runHarnessValidate(&stdout, &stderr, missing)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, harness.ErrMissingHarnessFile))
-	require.Contains(t, stderr.String(), "missing_harness_file")
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs(append([]string{"harness", "validate"}, args...))
+	err := root.Execute()
+	return stdout.String(), stderr.String(), err
 }
 
-func TestRunHarnessValidate_ValidFile(t *testing.T) {
-	path := writeTempHarness(t, goodHarness)
+func TestHarnessValidate_ValidFileExitsZero(t *testing.T) {
+	t.Parallel()
 
-	var stdout, stderr bytes.Buffer
-	err := runHarnessValidate(&stdout, &stderr, path)
+	path := writeHarnessFile(t, validHarness)
+	stdout, _, err := runValidate(t, path)
 	require.NoError(t, err)
-	out := stdout.String()
-	require.True(t, strings.HasPrefix(out, "OK:"), "expected stdout to begin with OK, got %q", out)
-	require.Contains(t, out, "templates [coder, planner, verifier]")
-	require.Empty(t, stderr.String())
+	require.Contains(t, stdout, "OK ")
+	require.Contains(t, stdout, "coder")
 }
 
-func TestRunHarnessValidate_MultiErrorFilePrintsAllProblems(t *testing.T) {
-	// No project.id, no api_key, no provider, pipeline references missing role.
-	body := `---
-tracker:
-  kind: linear
-  project_slug: team
-providers:
-  default:
-    provider: ""
-routing:
-  pipeline: [planner, coder, verifier, reviewer]
----
+func TestHarnessValidate_MissingFileExitsNonZero(t *testing.T) {
+	t.Parallel()
 
-## planner
-
-p
-
-## coder
-
-c
-
-## verifier
-
-v
-`
-	path := writeTempHarness(t, body)
-
-	var stdout, stderr bytes.Buffer
-	err := runHarnessValidate(&stdout, &stderr, path)
+	missing := filepath.Join(t.TempDir(), "nope.md")
+	stdout, _, err := runValidate(t, missing)
 	require.Error(t, err)
-	out := stderr.String()
-
-	for _, want := range []string{
-		"project_id_missing",
-		"tracker_api_key_missing",
-		"provider_unsupported",
-		"pipeline_role_missing_template",
-	} {
-		require.Contains(t, out, want, "expected stderr to mention %q, got:\n%s", want, out)
-	}
+	// Structured error is printed to stdout with the SPEC sentinel string.
+	require.Contains(t, stdout, "missing_harness_file")
 }
 
-func TestRunHarnessValidate_BadTemplateSyntaxClassifiedAsTemplateParse(t *testing.T) {
-	body := `---
+func TestHarnessValidate_ValidationFailureExitsNonZero(t *testing.T) {
+	t.Parallel()
+
+	// Parses and decodes, but the default pipeline expects planner+verifier
+	// templates that this harness omits.
+	path := writeHarnessFile(t, `---
 project:
   id: demo
 tracker:
   kind: linear
-  api_key: secret
-  project_slug: team
+  api_key: t
+  project_slug: x
 providers:
   default:
-    provider: anthropic
-    api_key: ank
-routing:
-  pipeline: [planner, coder, verifier]
+    provider: openrouter
+    api_key: sk
 ---
-
-## planner
-
-{{ }}
 
 ## coder
 
-c
-
-## verifier
-
-v
-`
-	path := writeTempHarness(t, body)
-
-	var stdout, stderr bytes.Buffer
-	err := runHarnessValidate(&stdout, &stderr, path)
+Implement.
+`)
+	stdout, _, err := runValidate(t, path)
 	require.Error(t, err)
-	require.Contains(t, stderr.String(), "template_parse_error")
+	require.Contains(t, stdout, "FAIL ")
+	require.Contains(t, stdout, "planner")
 }
 
-func TestFlatten_JoinedErrors(t *testing.T) {
-	joined := errors.Join(errors.New("a"), errors.New("b"), errors.Join(errors.New("c"), errors.New("d")))
-	out := flatten(joined)
-	require.Len(t, out, 4)
+func TestHarnessValidate_JSONOutput(t *testing.T) {
+	t.Parallel()
+
+	path := writeHarnessFile(t, validHarness)
+	stdout, _, err := runValidate(t, path, "--format", "json")
+	require.NoError(t, err)
+
+	var rep struct {
+		OK    bool     `json:"ok"`
+		Roles []string `json:"roles"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(stdout), &rep))
+	require.True(t, rep.OK)
+	require.ElementsMatch(t, []string{"planner", "coder", "verifier"}, rep.Roles)
+}
+
+func TestHarnessValidate_EnvVarFallback(t *testing.T) {
+	path := writeHarnessFile(t, validHarness)
+	t.Setenv("CONDUCTOR_HARNESS_PATH", path)
+
+	// No positional arg and no --harness flag: resolution must fall back to
+	// $CONDUCTOR_HARNESS_PATH per SPEC §5.1.
+	stdout, _, err := runValidate(t)
+	require.NoError(t, err)
+	require.Contains(t, stdout, "OK ")
 }

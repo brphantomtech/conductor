@@ -5,207 +5,147 @@ import (
 	"fmt"
 
 	"github.com/conductor-sh/conductor/internal/config"
-	"github.com/conductor-sh/conductor/internal/provider"
-	"github.com/conductor-sh/conductor/internal/tracker"
 )
 
-// supportedTrackerKinds mirrors config.supportedTrackerKind. Duplicated
-// here so the validator can attribute each failure to a sentinel without
-// stringly matching on the message produced by config.Validate.
-var supportedTrackerKinds = map[string]bool{
-	"linear":   true,
-	"github":   true,
-	"jira":     true,
-	"plane":    true,
-	"shortcut": true,
+// ValidationIssue is one non-fatal finding emitted by Validate. Issues are
+// surfaced both individually (via errors.Join in the returned error) and as
+// a slice on ValidationResult so the CLI can render a structured report.
+type ValidationIssue struct {
+	// Sentinel is one of the SPEC §23.1 sentinels (ErrTemplateParse,
+	// ErrTemplateRender, ErrHarnessParse, ErrHarnessFrontMatterShape).
+	Sentinel error
+
+	// Role is the agent role the issue is associated with, if any.
+	// Validation findings that span the whole document leave this empty.
+	Role string
+
+	// Message is the human-readable description that appears in CLI
+	// output and audit events.
+	Message string
 }
 
-// trackerRequiresProjectRef maps each tracker kind to whether it needs
-// project_id or project_slug. Kept in lockstep with
-// config.requiresProjectID; keep both in sync if the SPEC adds trackers.
-var trackerRequiresProjectRef = map[string]bool{
-	"linear":   true,
-	"github":   true,
-	"jira":     true,
-	"plane":    true,
-	"shortcut": true,
+// Error implements the error interface so a ValidationIssue can be
+// composed with errors.Join.
+func (v ValidationIssue) Error() string {
+	if v.Role == "" {
+		return fmt.Sprintf("%s: %s", v.Sentinel.Error(), v.Message)
+	}
+	return fmt.Sprintf("%s: role %q: %s", v.Sentinel.Error(), v.Role, v.Message)
 }
 
-var supportedProviders = map[string]bool{
-	"openrouter": true,
-	"anthropic":  true,
-	"openai":     true,
-	"ollama":     true,
-	"lm_studio":  true,
-	"custom":     true,
+// Unwrap exposes the sentinel so errors.Is finds the SPEC classification.
+func (v ValidationIssue) Unwrap() error { return v.Sentinel }
+
+// ValidationResult is the structured finding set Validate returns alongside
+// its joined error. Callers that want to render per-role issues (the CLI's
+// `harness validate` subcommand, the dashboard's harness editor) iterate
+// Issues; callers that want a single Go error use the returned error.
+type ValidationResult struct {
+	Issues []ValidationIssue
 }
 
-// providersNeedAPIKey lists providers that talk to a hosted endpoint and
-// therefore require an api_key. Local providers (ollama, lm_studio) are
-// permitted to leave it blank.
-var providersNeedAPIKey = map[string]bool{
-	"openrouter": true,
-	"anthropic":  true,
-	"openai":     true,
-	"custom":     true,
-}
+// HasErrors reports whether the result contains at least one issue.
+func (r ValidationResult) HasErrors() bool { return len(r.Issues) > 0 }
 
-var supportedKnowledgeBackends = map[string]bool{
-	"sqlite_vec": true,
-	"qdrant":     true,
-}
-
-var supportedMemoryBackends = map[string]bool{
-	"sqlite":   true,
-	"postgres": true,
-}
-
-var supportedDocBackends = map[string]bool{
-	"local_fs":   true,
-	"git_repo":   true,
-	"s3":         true,
-	"notion":     true,
-	"confluence": true,
-	"custom":     true,
-}
-
-// Validate runs SPEC §6.4 startup checks against a parsed Definition +
-// merged Config, plus the cross-cutting "every pipeline role has a
-// template" rule. Every detected problem is included in the returned
-// joined error so the operator sees them all at once.
+// Validate cross-checks a parsed Definition against the typed Config decoded
+// from its front matter. It implements the harness-side of SPEC §6.4
+// startup validation:
 //
-// Validate also compile-tests every prompt template — a syntax error in
-// any role surfaces as ErrTemplateParse inside the joined error.
+//   - Every prompt template must parse as valid Liquid.
+//   - Every prompt template must render against the SPEC §16.2 mock
+//     bindings without unknown-variable / unknown-filter errors.
+//   - Every role referenced by routing.pipeline and routing.rules[].pipeline
+//     must have a matching prompt template (SPEC §6.4 final bullet).
 //
-// A nil error means the harness is ready to dispatch; a non-nil error
-// means startup must abort.
-func Validate(def *Definition, cfg config.Config) error {
-	var errs []error
-
+// Validate does NOT re-run config.Validate; the orchestrator chains the two
+// because each addresses a different layer (typed-config shape vs.
+// harness-template integrity).
+func Validate(def *Definition, cfg config.Config) (ValidationResult, error) {
 	if def == nil {
-		return fmt.Errorf("harness: Validate called with nil definition")
+		return ValidationResult{}, fmt.Errorf("%w: definition is nil", ErrHarnessParse)
 	}
 
-	if cfg.Project.ID == "" {
-		errs = append(errs, fmt.Errorf("%w: project.id is required", ErrProjectIDMissing))
-	}
+	var result ValidationResult
 
-	if cfg.Tracker.Kind == "" {
-		errs = append(errs, fmt.Errorf("%w: tracker.kind is required", ErrTrackerKindMissing))
-	} else if !supportedTrackerKinds[cfg.Tracker.Kind] {
-		errs = append(errs, fmt.Errorf("%w: tracker.kind %q is not supported", ErrTrackerKindUnsupported, cfg.Tracker.Kind))
-	}
-
-	if cfg.Tracker.APIKey == "" {
-		errs = append(errs, fmt.Errorf("%w: tracker.api_key is required", ErrTrackerAPIKeyMissing))
-	}
-
-	if cfg.Tracker.Kind != "" && trackerRequiresProjectRef[cfg.Tracker.Kind] &&
-		cfg.Tracker.ProjectID == "" && cfg.Tracker.ProjectSlug == "" {
-		errs = append(errs, fmt.Errorf("%w: tracker.project_id or project_slug is required for kind %q", ErrTrackerProjectRefMissing, cfg.Tracker.Kind))
-	}
-
-	if cfg.Providers.Default.Provider == "" {
-		errs = append(errs, fmt.Errorf("%w: providers.default.provider is required", ErrProviderUnsupported))
-	} else if !supportedProviders[cfg.Providers.Default.Provider] {
-		errs = append(errs, fmt.Errorf("%w: providers.default.provider %q is not supported", ErrProviderUnsupported, cfg.Providers.Default.Provider))
-	} else if providersNeedAPIKey[cfg.Providers.Default.Provider] && cfg.Providers.Default.APIKey == "" {
-		errs = append(errs, fmt.Errorf("%w: providers.default.api_key is required for provider %q", ErrProviderAPIKeyMissing, cfg.Providers.Default.Provider))
-	}
-
-	if cfg.Knowledge.StoreBackend != "" && !supportedKnowledgeBackends[cfg.Knowledge.StoreBackend] {
-		errs = append(errs, fmt.Errorf("%w: knowledge.store_backend %q is not supported", ErrKnowledgeBackendUnsupported, cfg.Knowledge.StoreBackend))
-	}
-
-	if cfg.Memory.StoreBackend != "" && !supportedMemoryBackends[cfg.Memory.StoreBackend] {
-		errs = append(errs, fmt.Errorf("%w: memory.store_backend %q is not supported", ErrMemoryBackendUnsupported, cfg.Memory.StoreBackend))
-	}
-
-	for i, store := range cfg.Docs.Stores {
-		if store.Backend == "" || supportedDocBackends[store.Backend] {
+	for role, src := range def.PromptTemplates {
+		if perr := CheckTemplate(src); perr != nil {
+			result.Issues = append(result.Issues, ValidationIssue{
+				Sentinel: ErrTemplateParse,
+				Role:     role,
+				Message:  perr.Error(),
+			})
 			continue
 		}
-		errs = append(errs, fmt.Errorf("%w: docs.stores[%d].backend %q is not supported", ErrDocStoreBackendUnsupported, i, store.Backend))
-	}
-
-	// Delegate the SPEC §23.3 provider-block checks to the provider
-	// package — it owns the supported-kinds list, the loopback-loopback
-	// auth rules, the custom-requires-base_url rule, and the
-	// compaction_strategy enum. The harness sentinels above are kept so
-	// the existing CLI categorisation continues to work; this call
-	// supplements them with the SPEC §23.3 classifications.
-	if err := provider.Validate(cfg.Providers); err != nil {
-		errs = append(errs, err)
-	}
-
-	// Delegate the SPEC §23.2 tracker-block checks to the tracker
-	// package — it owns the supported-kinds list, the project_slug /
-	// project_id rules per kind, and the empty-active_states warning.
-	// The harness sentinels above (ErrTrackerKindMissing, etc.) are
-	// kept so the existing CLI categorisation continues to work; this
-	// call supplements them with the SPEC §23.2 classifications.
-	if err := tracker.Validate(cfg.Tracker); err != nil {
-		errs = append(errs, err)
-	}
-
-	// Pipeline role → template coverage.
-	missing := collectMissingTemplates(def, cfg)
-	for _, m := range missing {
-		errs = append(errs, fmt.Errorf("%w: role %q (from %s) has no `## %s` section", ErrPipelineRoleMissingTemplate, m.role, m.origin, m.role))
-	}
-
-	// Compile-test every template. Catches syntax errors at validate
-	// time so the operator sees them in one shot rather than waiting
-	// for the first turn to render.
-	renderer := NewRenderer()
-	for role, src := range def.PromptTemplates {
-		if _, err := renderer.Compile(role, src); err != nil {
-			errs = append(errs, err)
+		// Dry-render against mock bindings so unknown filters and
+		// undefined variables are caught before any agent runs.
+		if _, rerr := Render(src, MockBindings()); rerr != nil {
+			sentinel := ErrTemplateRender
+			if errors.Is(rerr, ErrTemplateParse) {
+				sentinel = ErrTemplateParse
+			}
+			result.Issues = append(result.Issues, ValidationIssue{
+				Sentinel: sentinel,
+				Role:     role,
+				Message:  rerr.Error(),
+			})
 		}
 	}
 
-	if len(errs) == 0 {
-		return nil
+	missing := missingPipelineTemplates(def.PromptTemplates, cfg.Routing)
+	for _, role := range missing {
+		result.Issues = append(result.Issues, ValidationIssue{
+			Sentinel: ErrHarnessParse,
+			Role:     role,
+			Message: fmt.Sprintf(
+				"role %q is referenced by routing.pipeline but has no `## %s` section in HARNESS.md",
+				role, role,
+			),
+		})
 	}
-	return errors.Join(errs...)
+
+	if !result.HasErrors() {
+		return result, nil
+	}
+	errs := make([]error, len(result.Issues))
+	for i, iss := range result.Issues {
+		errs[i] = iss
+	}
+	return result, errors.Join(errs...)
 }
 
-// missingTemplate records the role + the routing location that named it.
-// "origin" is one of `routing.pipeline` or `routing.rules[<i>].pipeline`.
-type missingTemplate struct {
-	role   string
-	origin string
-}
+// missingPipelineTemplates returns the roles referenced by routing.pipeline
+// or any routing.rules[].pipeline that have no corresponding prompt
+// template. Order is deterministic: pipeline first, then rules in the
+// order they appear, with duplicates removed.
+func missingPipelineTemplates(templates map[string]string, routing config.Routing) []string {
+	seen := map[string]struct{}{}
+	for role := range templates {
+		seen[role] = struct{}{}
+	}
 
-// collectMissingTemplates returns the (role, origin) pairs for every
-// role mentioned in cfg.Routing that has no matching prompt template.
-func collectMissingTemplates(def *Definition, cfg config.Config) []missingTemplate {
-	var out []missingTemplate
-	seen := map[string]bool{}
-
-	check := func(role, origin string) {
+	var missing []string
+	missingSet := map[string]struct{}{}
+	check := func(role string) {
 		if role == "" {
 			return
 		}
-		if _, ok := def.PromptTemplates[role]; ok {
+		if _, ok := seen[role]; ok {
 			return
 		}
-		key := role + "@" + origin
-		if seen[key] {
+		if _, dup := missingSet[role]; dup {
 			return
 		}
-		seen[key] = true
-		out = append(out, missingTemplate{role: role, origin: origin})
+		missingSet[role] = struct{}{}
+		missing = append(missing, role)
 	}
 
-	for _, role := range cfg.Routing.Pipeline {
-		check(role, "routing.pipeline")
+	for _, role := range routing.Pipeline {
+		check(role)
 	}
-	for i, rule := range cfg.Routing.Rules {
-		origin := fmt.Sprintf("routing.rules[%d].pipeline", i)
+	for _, rule := range routing.Rules {
 		for _, role := range rule.Pipeline {
-			check(role, origin)
+			check(role)
 		}
 	}
-	return out
+	return missing
 }
