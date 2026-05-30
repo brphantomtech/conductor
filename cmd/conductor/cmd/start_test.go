@@ -13,6 +13,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// goodHarness is a minimal, valid HARNESS.md: complete enough to pass
+// config validation and to extract three prompt-template roles.
+const goodHarness = `---
+project:
+  id: demo
+  name: Demo
+tracker:
+  kind: linear
+  project_slug: team
+  api_key: lin_test
+providers:
+  default:
+    provider: anthropic
+    model: claude-sonnet-4-5
+    api_key: ank_test
+routing:
+  pipeline: [planner, coder, verifier]
+---
+
+## planner
+
+plan
+
+## coder
+
+code
+
+## verifier
+
+verify
+`
+
 // withCwd temporarily switches the working directory to dir for the
 // duration of fn. Restores the previous cwd on return.
 func withCwd(t *testing.T, dir string, fn func()) {
@@ -50,7 +82,7 @@ func TestRunStart_DryRunReportsTemplateRoles(t *testing.T) {
 		out := stdout.String()
 		require.True(t, strings.HasPrefix(out, "dry run complete:"), "got %q", out)
 		require.Contains(t, out, "templates=[coder planner verifier]")
-		require.Contains(t, out, "source=flag")
+		require.Contains(t, out, "harness="+path)
 	})
 }
 
