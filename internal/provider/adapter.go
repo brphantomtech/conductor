@@ -33,6 +33,14 @@ type Adapter interface {
 	// have a hook.
 	ContinueTurn(ctx context.Context, s *Session, prompt string) (TurnStream, error)
 
+	// ContinueWithToolResults continues the same session with the results of
+	// one or more tool calls the model emitted on the prior turn (SPEC §7.1,
+	// §7.3). The adapter renders the results in its native shape (Anthropic
+	// `tool_result` content blocks; OpenAI-compatible `role: "tool"` messages)
+	// and returns a TurnStream for the model's follow-up turn. It returns
+	// ErrNoToolCall when the session has not emitted a tool call.
+	ContinueWithToolResults(ctx context.Context, s *Session, results []ToolResult) (TurnStream, error)
+
 	// EndSession releases per-session state. Subsequent StartTurn /
 	// ContinueTurn calls against the same Session return an error.
 	EndSession(ctx context.Context, s *Session) error
