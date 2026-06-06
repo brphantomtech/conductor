@@ -143,6 +143,57 @@ func New(cfg config.Docs, projectID string, opts ...Option) (*Manager, error) {
 	return m, nil
 }
 
+// Hydrate seeds each store's last-good DocRef set from already-persisted `doc`
+// nodes so a fresh process downloads only changed documents on the next sync.
+// It is a no-op when the store does not support structural queries. Hydration is
+// idempotent and best-effort: a query failure is returned but never partially
+// applied.
+func (m *Manager) Hydrate(ctx context.Context) error {
+	q, ok := m.store.(nodeQuerier)
+	if !ok || m.store == nil {
+		return nil
+	}
+	nodes, err := q.QueryStructural(ctx, knowledge.Filter{Types: []knowledge.NodeType{knowledge.NodeDoc}}, 0)
+	if err != nil {
+		return fmt.Errorf("docstore: hydrate: %w", err)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, n := range nodes {
+		storeID, pathOrID, ok := splitDocPath(n.Path)
+		if !ok {
+			continue
+		}
+		st, known := m.stores[storeID]
+		if !known {
+			continue
+		}
+		st.refs[pathOrID] = DocRef{
+			ID:           DocRefID(storeID, pathOrID),
+			Title:        n.Name,
+			StoreID:      storeID,
+			PathOrID:     pathOrID,
+			ContentHash:  n.Checksum,
+			LastSyncedAt: n.LastIndexedAt,
+		}
+	}
+	return nil
+}
+
+// splitDocPath reverses docPath: "docs/<store>/<path_or_id>" → (store, path).
+func splitDocPath(p string) (storeID, pathOrID string, ok bool) {
+	const prefix = "docs/"
+	if len(p) <= len(prefix) || p[:len(prefix)] != prefix {
+		return "", "", false
+	}
+	rest := p[len(prefix):]
+	idx := indexByte(rest, '/')
+	if idx <= 0 || idx == len(rest)-1 {
+		return "", "", false
+	}
+	return rest[:idx], rest[idx+1:], true
+}
+
 // SyncAll syncs every configured store once, returning the joined error of any
 // store failures. A failed store retains its last-good document set.
 func (m *Manager) SyncAll(ctx context.Context) error {

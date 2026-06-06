@@ -17,6 +17,14 @@ type knowledgeStore interface {
 	DeleteByPath(ctx context.Context, projectID, path string) error
 }
 
+// nodeQuerier is the optional structural-query capability used to hydrate the
+// manager's last-good DocRef set from already-persisted `doc` nodes so a fresh
+// process (e.g. a one-shot `conductor docs sync`) still downloads only changed
+// documents. A knowledgeStore that does not implement it simply skips hydration.
+type nodeQuerier interface {
+	QueryStructural(ctx context.Context, filter knowledge.Filter, topK int) ([]knowledge.Node, error)
+}
+
 // docEmbedder produces a dense vector for the document body so the `doc` node is
 // retrievable through the Knowledge Engine's semantic path. Defined at the
 // consumer; a nil embedder leaves embeddings empty (structural search still
