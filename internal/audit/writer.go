@@ -18,22 +18,39 @@ import (
 // Sinks can be added at any time. Write is safe for concurrent use; the
 // orchestrator and per-turn workers all call it.
 type Writer struct {
-	mu    sync.RWMutex
-	sinks []Sink
-	log   zerolog.Logger
-	now   func() time.Time
-	id    func() string
+	mu     sync.RWMutex
+	sinks  []Sink
+	log    zerolog.Logger
+	now    func() time.Time
+	id     func() string
+	redact *Redactor
+}
+
+// WriterOption configures a Writer at construction time.
+type WriterOption func(*Writer)
+
+// WithRedactor installs the secret Redactor applied to every event payload
+// before fan-out (SPEC §21.1). Doing it at the Writer boundary covers all
+// sinks (DB, JSONL, webhook) uniformly. A nil redactor leaves payloads as-is.
+func WithRedactor(r *Redactor) WriterOption {
+	return func(w *Writer) { w.redact = r }
 }
 
 // NewWriter constructs a Writer with no sinks attached. Add sinks via
 // AddSink before the first Write. The logger is used to record sink
 // failures so an unreachable webhook does not silently swallow events.
-func NewWriter(log zerolog.Logger) *Writer {
-	return &Writer{
+func NewWriter(log zerolog.Logger, opts ...WriterOption) *Writer {
+	w := &Writer{
 		log: log.With().Str("subsystem", "audit").Logger(),
 		now: time.Now,
 		id:  newUUID,
 	}
+	for _, o := range opts {
+		if o != nil {
+			o(w)
+		}
+	}
+	return w
 }
 
 // AddSink registers a Sink for fan-out. Order is preserved; sinks are
@@ -62,6 +79,9 @@ func (w *Writer) Write(ctx context.Context, evt AuditEvent) error {
 	}
 	if evt.Payload == nil {
 		evt.Payload = map[string]any{}
+	}
+	if w.redact != nil {
+		evt = w.redact.Redact(evt)
 	}
 
 	w.mu.RLock()

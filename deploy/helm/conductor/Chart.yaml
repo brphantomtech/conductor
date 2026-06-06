@@ -1,0 +1,14 @@
+apiVersion: v2
+name: conductor
+description: |
+  Sample Helm chart for Conductor — the harness-first AI agent orchestration
+  service (Profile C cloud deployment, SPEC §3.2). This is a minimal starting
+  point (Deployment + Service + ConfigMap), not a production-hardened chart.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - conductor
+  - orchestrator
+  - ai-agents
+home: https://github.com/conductor-sh/conductor

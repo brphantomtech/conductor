@@ -3,6 +3,7 @@ package workspace
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -24,13 +25,15 @@ type cloneFunc func(ctx context.Context, repo config.WorkspaceRepo, dest string)
 // project. It is constructed once (Phase 6 orchestrator) and is safe for
 // concurrent use across issues — it holds no per-workspace mutable state.
 type Manager struct {
-	cfg       config.Workspace
-	hooks     config.Hooks
-	log       zerolog.Logger
-	clock     func() time.Time
-	audit     *audit.Writer
-	projectID string
-	clone     cloneFunc
+	cfg        config.Workspace
+	hooks      config.Hooks
+	log        zerolog.Logger
+	clock      func() time.Time
+	audit      *audit.Writer
+	projectID  string
+	clone      cloneFunc
+	container  ContainerRunner
+	socketPath string
 }
 
 // Option configures a Manager at construction time.
@@ -62,6 +65,20 @@ func withCloner(c cloneFunc) Option {
 			m.clone = c
 		}
 	}
+}
+
+// WithContainerRunner injects the ContainerRunner used when
+// workspace.container is configured. When unset, the Manager lazily builds a
+// DockerRunner backed by the live daemon (NewDockerRunner) the first time a
+// container run is needed. Tests inject a fake here.
+func WithContainerRunner(r ContainerRunner) Option {
+	return func(m *Manager) { m.container = r }
+}
+
+// WithToolSocketPath sets the host tool socket path bind-mounted into
+// container-isolated runs (SPEC §21.3). Empty means no socket is mounted.
+func WithToolSocketPath(path string) Option {
+	return func(m *Manager) { m.socketPath = path }
 }
 
 // New constructs a Manager from the workspace and hooks config slices.
@@ -178,6 +195,70 @@ func (m *Manager) AgentCommand(ctx context.Context, ws *Workspace, name string, 
 	cmd.Dir = ws.Path
 	setProcessGroup(cmd)
 	return cmd, nil
+}
+
+// UseContainer reports whether agent runs for this Manager are
+// container-isolated (SPEC §14.3). It is true exactly when a
+// workspace.container block is configured; otherwise the default subprocess
+// AgentCommand path is used unchanged. Callers select the execution path on
+// this predicate.
+func (m *Manager) UseContainer() bool {
+	return m.cfg.Container != nil
+}
+
+// RunAgent executes one agent command for the workspace using the configured
+// isolation: when workspace.container is set it launches a container with the
+// workspace mounted as the only writable mount, resource limits applied, and
+// networking disabled by default (SPEC §21.3); otherwise it falls back to the
+// subprocess AgentCommand path and runs the command. It returns the process
+// exit code.
+//
+// The subprocess path here is exactly the existing AgentCommand seam (Invariant
+// 1: the agent runs within workspace_path), so behavior is unchanged when no
+// container is configured.
+func (m *Manager) RunAgent(ctx context.Context, ws *Workspace, name string, args ...string) (int, error) {
+	if !m.UseContainer() {
+		cmd, err := m.AgentCommand(ctx, ws, name, args...)
+		if err != nil {
+			return -1, err
+		}
+		if err := cmd.Run(); err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				return exitErr.ExitCode(), nil
+			}
+			return -1, fmt.Errorf("workspace: run agent command: %w", err)
+		}
+		return 0, nil
+	}
+
+	if ws == nil || ws.Path == "" {
+		return -1, fmt.Errorf("workspace: container run without workspace: %w", ErrUnsafePath)
+	}
+	if !withinRoot(m.absRoot(), ws.Path) {
+		return -1, fmt.Errorf("workspace: container run path %q outside root: %w", ws.Path, ErrUnsafePath)
+	}
+
+	spec, err := buildContainerSpec(m.cfg.Container, ws, m.socketPath, name, args)
+	if err != nil {
+		return -1, err
+	}
+	runner := m.containerRunner()
+	code, err := runner.Run(ctx, spec)
+	if err != nil {
+		return code, err
+	}
+	return code, nil
+}
+
+// containerRunner returns the injected ContainerRunner, lazily constructing a
+// live DockerRunner when none was injected.
+func (m *Manager) containerRunner() ContainerRunner {
+	if m.container != nil {
+		return m.container
+	}
+	m.container = NewDockerRunner(WithDockerLogger(m.log))
+	return m.container
 }
 
 // Resolve returns the Workspace handle for an issue without touching the

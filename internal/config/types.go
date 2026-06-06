@@ -49,9 +49,49 @@ type Polling struct {
 
 // Workspace corresponds to SPEC §5.3.4.
 type Workspace struct {
-	Root  string          `yaml:"root"  mapstructure:"root"`
-	Repos []WorkspaceRepo `yaml:"repos" mapstructure:"repos"`
+	Root      string          `yaml:"root"      mapstructure:"root"`
+	Repos     []WorkspaceRepo `yaml:"repos"     mapstructure:"repos"`
+	Container *Container      `yaml:"container" mapstructure:"container"`
 }
+
+// Container is the opt-in Docker-per-workspace isolation block (SPEC §14.3,
+// §21.3). When present on Workspace, agent runs execute inside a container with
+// the workspace mounted as the only writable mount, resource limits applied,
+// and networking disabled by default. When nil, the default goroutine +
+// subprocess isolation (SPEC §14.3) runs unchanged.
+type Container struct {
+	// Image is the container image the agent run launches from. Required when
+	// a container block is configured.
+	Image string `yaml:"image" mapstructure:"image"`
+	// Network is the Docker network mode. Defaults to "none" (air-gapped):
+	// the agent reaches Conductor only through the mounted tool socket.
+	Network string `yaml:"network" mapstructure:"network"`
+	// MemoryLimit is the container memory cap (Docker form, e.g. "512m",
+	// "2g"). Empty means no explicit limit.
+	MemoryLimit string `yaml:"memory_limit" mapstructure:"memory_limit"`
+	// CPULimit is the fractional CPU cap (Docker --cpus form, e.g. "1.5").
+	// Empty means no explicit limit.
+	CPULimit string `yaml:"cpu_limit" mapstructure:"cpu_limit"`
+	// ExtraMounts lists additional host→container bind mounts beyond the
+	// workspace mount. Each entry is an opt-in exception to the otherwise
+	// mount-scoped filesystem.
+	ExtraMounts []ContainerMount `yaml:"extra_mounts" mapstructure:"extra_mounts"`
+}
+
+// ContainerMount is one host→container bind mount in Container.ExtraMounts.
+type ContainerMount struct {
+	// Source is the host path to mount.
+	Source string `yaml:"source" mapstructure:"source"`
+	// Target is the in-container mount path.
+	Target string `yaml:"target" mapstructure:"target"`
+	// ReadOnly mounts the bind read-only when true.
+	ReadOnly bool `yaml:"read_only" mapstructure:"read_only"`
+}
+
+// ContainerNetworkNone is the default, air-gapped network mode for a
+// container-isolated workspace (SPEC §21.3): no external network, tool calls
+// flow only over the mounted Unix socket.
+const ContainerNetworkNone = "none"
 
 // WorkspaceRepo describes a single repository inside a multi-repo workspace.
 type WorkspaceRepo struct {

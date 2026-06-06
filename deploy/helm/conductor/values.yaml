@@ -1,0 +1,65 @@
+# Default values for the Conductor sample chart.
+
+replicaCount: 1
+
+image:
+  repository: conductor
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Name overrides.
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+
+# HARNESS.md front matter mounted via the ConfigMap. Provide the project's real
+# harness config here (or render it from your own pipeline). Secrets such as
+# tracker.api_key and provider api keys SHOULD come from a Secret + $VAR
+# expansion, never inlined here.
+harness: |
+  ---
+  project:
+    id: example
+    name: Example Project
+  tracker:
+    kind: github
+    api_key: $TRACKER_API_KEY
+    project_id: example/repo
+  providers:
+    default:
+      provider: anthropic
+      model: claude-sonnet-4-5
+      api_key: $PROVIDER_API_KEY
+  ---
+
+# Environment variables sourced from a pre-existing Secret. The keys here become
+# $VAR references the harness config expands at load time (SPEC §6.2).
+envFromSecret: ""   # e.g. "conductor-secrets"
+
+resources:
+  limits:
+    cpu: "2"
+    memory: 1Gi
+  requests:
+    cpu: "500m"
+    memory: 512Mi
+
+# Persistent state (SQLite DB + workspaces). Disabled by default; enable for a
+# durable single-replica deployment.
+persistence:
+  enabled: false
+  size: 10Gi
+  storageClass: ""
+  mountPath: /var/lib/conductor
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

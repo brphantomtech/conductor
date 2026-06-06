@@ -102,6 +102,13 @@ func Load(opts LoadOptions) (Config, error) {
 		return Config{}, fmt.Errorf("config: unmarshal: %w", err)
 	}
 
+	// A container block defaults to air-gapped networking (SPEC §21.3). The
+	// field is a pointer, so the default cannot live in Defaults() (it would
+	// not merge beneath a user block); normalize it here once resolved.
+	if cfg.Workspace.Container != nil && cfg.Workspace.Container.Network == "" {
+		cfg.Workspace.Container.Network = ContainerNetworkNone
+	}
+
 	// 4. $VAR indirection over the resolved string fields. The set of
 	//    fields that participate in expansion is intentionally small — only
 	//    fields the SPEC §6.2 lists as path/credential strings.
