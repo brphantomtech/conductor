@@ -64,6 +64,11 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newStartCommand(rctx))
 	root.AddCommand(newMemoryCommand())
 	root.AddCommand(newValidationCommand())
+	root.AddCommand(newWorkspaceCommand())
+	root.AddCommand(newInitCommand())
+	root.AddCommand(newStatusCommand())
+	root.AddCommand(newDispatchCommand())
+	root.AddCommand(newCancelCommand())
 
 	return root
 }
