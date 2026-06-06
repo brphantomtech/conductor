@@ -38,7 +38,7 @@ one focused session.
 ## 6. CLI Wiring
 
 - [x] 6.1 Implement `conductor validation run` in a new `cmd/conductor/cmd/cmd_validation.go` (ad-hoc execution against a workspace).
-- [ ] 6.2 **Integration commit (final, append-only):** register `newValidationCommand()` in `cmd/conductor/cmd/root.go`; construct the pipeline in `cmd/conductor/cmd/start.go` `runOrchestrator` and expose it for the turn loop; update `AGENTS.md` navigation for `internal/validation`.
+- [x] 6.2 **Integration commit (final, append-only):** register `newValidationCommand()` in `cmd/conductor/cmd/root.go`; construct the pipeline in `cmd/conductor/cmd/start.go` `runOrchestrator` and expose it for the turn loop; update `AGENTS.md` navigation for `internal/validation`.
 
 ## 7. Verification
 
