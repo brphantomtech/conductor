@@ -66,10 +66,10 @@ func approve(toolName string, policy ApprovalPolicy) Decision {
 func approvalRequiredResult(toolName string, policy ApprovalPolicy) ToolResult {
 	return ToolResult{
 		Content: map[string]any{
-			"error":           ErrApprovalRequired.Error(),
+			"error":             ErrApprovalRequired.Error(),
 			"approval_required": true,
-			"tool":            toolName,
-			"policy":          string(policy),
+			"tool":              toolName,
+			"policy":            string(policy),
 			"message": "This tool call requires operator approval under the active " +
 				"approval policy and no approval channel is available; the call was not executed.",
 		},

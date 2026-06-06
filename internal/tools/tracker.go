@@ -78,7 +78,9 @@ func (t *trackerMutateTool) ParametersSchema() json.RawMessage {
 }`)
 }
 
-func (t *trackerMutateTool) Execute(ctx context.Context, params map[string]any, _ ExecutionContext) (ToolResult, error) {
+func (t *trackerMutateTool) Execute(
+	ctx context.Context, params map[string]any, _ ExecutionContext,
+) (ToolResult, error) {
 	if t.exec == nil {
 		return ToolResult{}, fmt.Errorf("tools: %s: %w", t.Name(), ErrEngineUnavailable)
 	}

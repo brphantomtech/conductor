@@ -72,7 +72,7 @@ func (a knowledgeSearchAdapter) SearchKnowledge(
 		TopK:        q.TopK,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("knowledge search: %w", err)
 	}
 	out := make([]tools.KnowledgeResult, 0, len(nodes))
 	for _, n := range nodes {
@@ -98,7 +98,7 @@ func (a docSearchAdapter) SearchDocs(ctx context.Context, query string, topK int
 		TopK:  topK,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("doc search: %w", err)
 	}
 	out := make([]tools.DocResult, 0, len(nodes))
 	for _, n := range nodes {
@@ -123,7 +123,7 @@ func (a memoryStoreAdapter) ReadMemory(ctx context.Context, q tools.MemoryReadQu
 		Intent:    q.Intent,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("memory read: %w", err)
 	}
 	out := make([]tools.MemoryResult, 0, len(entries))
 	for _, e := range entries {
@@ -148,7 +148,7 @@ func (a memoryStoreAdapter) WriteMemory(ctx context.Context, e tools.MemoryWrite
 		Source:    memory.SourceAgentWritten,
 	})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("memory write: %w", err)
 	}
 	if entry == nil {
 		return "", nil
@@ -194,7 +194,9 @@ func (a harnessCheckAdapter) CheckHarness(ctx context.Context, ruleID string) ([
 // pinning each run to the call's workspace path.
 type validationRunAdapter struct{ cfg config.Validation }
 
-func (a validationRunAdapter) RunValidation(ctx context.Context, workspacePath string) (tools.ValidationOutcome, error) {
+func (a validationRunAdapter) RunValidation(
+	ctx context.Context, workspacePath string,
+) (tools.ValidationOutcome, error) {
 	if workspacePath == "" {
 		workspacePath = "."
 	}

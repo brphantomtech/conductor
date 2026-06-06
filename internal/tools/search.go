@@ -30,7 +30,8 @@ func (t *knowledgeSearchTool) ParametersSchema() json.RawMessage {
   "type": "object",
   "properties": {
     "query": {"type": "string", "description": "Natural-language search seed."},
-    "types": {"type": "array", "items": {"type": "string"}, "description": "Restrict to node types (file, symbol, module, doc, ...)."},
+    "types": {"type": "array", "items": {"type": "string"},
+      "description": "Restrict to node types (file, symbol, module, doc, ...)."},
     "path_pattern": {"type": "string", "description": "Glob restricting results by path."},
     "top_k": {"type": "integer", "description": "Maximum number of results."}
   },
@@ -38,7 +39,9 @@ func (t *knowledgeSearchTool) ParametersSchema() json.RawMessage {
 }`)
 }
 
-func (t *knowledgeSearchTool) Execute(ctx context.Context, params map[string]any, _ ExecutionContext) (ToolResult, error) {
+func (t *knowledgeSearchTool) Execute(
+	ctx context.Context, params map[string]any, _ ExecutionContext,
+) (ToolResult, error) {
 	if t.eng == nil {
 		return ToolResult{}, fmt.Errorf("tools: %s: %w", t.Name(), ErrEngineUnavailable)
 	}

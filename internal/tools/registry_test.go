@@ -19,7 +19,7 @@ type stubTool struct {
 	calls  int
 }
 
-func (s *stubTool) Name() string                     { return s.name }
+func (s *stubTool) Name() string                      { return s.name }
 func (s *stubTool) Description() string               { return s.desc }
 func (s *stubTool) ParametersSchema() json.RawMessage { return s.schema }
 

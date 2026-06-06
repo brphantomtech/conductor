@@ -5,8 +5,9 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/conductor-sh/conductor/internal/audit"
 	"github.com/stretchr/testify/require"
+
+	"github.com/conductor-sh/conductor/internal/audit"
 )
 
 func TestApprove_Decisions(t *testing.T) {

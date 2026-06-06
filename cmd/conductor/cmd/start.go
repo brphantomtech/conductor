@@ -249,7 +249,7 @@ func runOrchestrator(
 	// reconciliation Part C below. nil when memory is disabled.
 	memoryManager, memCleanup, mErr := wireMemory(ctx, rctx, cfg, writer)
 	if mErr != nil {
-		return fmt.Errorf("start: construct memory manager: %w", mErr)
+		return mErr
 	}
 	if memCleanup != nil {
 		defer memCleanup()
@@ -413,7 +413,7 @@ func wireMemory(
 		memory.WithSynthesizer(embedder),
 	)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, fmt.Errorf("start: construct memory manager: %w", err)
 	}
 	return mgr, func() { _ = mgr.Close() }, nil
 }
