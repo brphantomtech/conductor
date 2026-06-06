@@ -12,6 +12,7 @@ import (
 	"github.com/conductor-sh/conductor/internal/config"
 	"github.com/conductor-sh/conductor/internal/db"
 	"github.com/conductor-sh/conductor/internal/harness"
+	"github.com/conductor-sh/conductor/internal/memory"
 	"github.com/conductor-sh/conductor/internal/orchestrator"
 	"github.com/conductor-sh/conductor/internal/provider"
 	"github.com/conductor-sh/conductor/internal/tracker"
@@ -207,7 +208,7 @@ func runOrchestrator(
 		templates = def.PromptTemplates
 	}
 
-	o := orchestrator.New(
+	orchOpts := []orchestrator.Option{
 		orchestrator.WithTracker(trackerAdapter),
 		orchestrator.WithWorkspaces(wsManager),
 		orchestrator.WithProvider(providerAdapter, coderCfg),
@@ -215,7 +216,29 @@ func runOrchestrator(
 		orchestrator.WithConfig(func() config.Config { return cfg }),
 		orchestrator.WithTemplates(func() map[string]string { return templates }),
 		orchestrator.WithLogger(rctx.log),
-	)
+	}
+
+	// Wire the Memory Manager as reconciliation Part C (SPEC §13.5): each
+	// terminal run writes a session-end episodic memory. Skipped when memory
+	// is disabled so the orchestrator behaves exactly as before this phase.
+	if cfg.Memory.Enabled {
+		consolidationCfg := resolveProviderConfig(cfg, cfg.Memory.ConsolidationProvider)
+		embedder := memory.NewAPIProvider(consolidationCfg, nil)
+		mgr, mErr := memory.New(ctx, cfg.Memory,
+			memory.WithProjectID(cfg.Project.ID),
+			memory.WithAudit(writer),
+			memory.WithLogger(rctx.log),
+			memory.WithEmbedder(embedder),
+			memory.WithSynthesizer(embedder),
+		)
+		if mErr != nil {
+			return fmt.Errorf("start: construct memory manager: %w", mErr)
+		}
+		defer func() { _ = mgr.Close() }()
+		orchOpts = append(orchOpts, orchestrator.WithMemoryPostProcessor(memory.NewPostProcessor(mgr)))
+	}
+
+	o := orchestrator.New(orchOpts...)
 
 	rctx.log.Info().Msg("orchestrator started")
 	if err := o.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {

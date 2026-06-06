@@ -61,6 +61,7 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newVersionCommand())
 	root.AddCommand(newHarnessCommand())
 	root.AddCommand(newStartCommand(rctx))
+	root.AddCommand(newMemoryCommand())
 
 	return root
 }
