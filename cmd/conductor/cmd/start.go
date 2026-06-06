@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
+	"sync"
 
 	"github.com/robfig/cron/v3"
+	"github.com/rs/zerolog"
 	"github.com/spf13/cobra"
 
 	"github.com/conductor-sh/conductor/internal/audit"
@@ -208,23 +211,21 @@ func runOrchestrator(
 		workspace.WithProjectID(cfg.Project.ID),
 	)
 
-	// Construct the Validation Pipeline (SPEC §15) so it is available to the
-	// turn loop. The live per-turn invocation point is owned by the Phase 7
-	// router (SPEC §12.4 step 5), which builds a workspace-scoped command
-	// factory per issue via validation.NewWorkspaceCommandFactory and calls
-	// Pipeline.Run; this phase constructs the shared, stateless pipeline.
-	validationPipeline := validation.New(cfg.Validation,
-		validation.WithLogger(rctx.log),
-		validation.WithAudit(writer),
-		validation.WithProjectID(cfg.Project.ID),
-	)
+	// Construct the Validation Pipeline runner (SPEC §15) that the Phase 7 router
+	// invokes after each role's turn (SPEC §12.4 step 5). The router's Validator
+	// seam is per-(workspace, role); validationRunner builds a workspace-pinned
+	// pipeline per call and applies the fail_on_severity decision.
+	validator := &validationRunner{
+		cfg:       cfg.Validation,
+		log:       rctx.log,
+		audit:     writer,
+		projectID: cfg.Project.ID,
+		turns:     map[string]int{},
+	}
 	rctx.log.Info().
 		Bool("validation_enabled", cfg.Validation.Enabled).
 		Int("validation_checks", len(cfg.Validation.Checks)).
 		Msg("validation pipeline ready")
-	// validationPipeline is handed to the router turn loop in Phase 7; retained
-	// here as the constructed, shared instance.
-	_ = validationPipeline
 
 	templates := map[string]string{}
 	if def != nil {
@@ -236,7 +237,7 @@ func runOrchestrator(
 	// startup, optionally start the incremental watcher, and report its
 	// knowledge_index_status. The Phase 13 tool and the Phase 6 poll-loop seam
 	// consume the engine later; here we own its lifecycle and log its status.
-	knowledgeStatus := wireKnowledge(ctx, rctx, cfg, writer)
+	knowledgeEngine, knowledgeStatus := wireKnowledge(ctx, rctx, cfg, writer)
 	rctx.log.Info().Str("knowledge_index_status", string(knowledgeStatus)).Msg("knowledge engine status")
 
 	configFn := func() config.Config { return cfg }
@@ -245,17 +246,12 @@ func runOrchestrator(
 	// Construct the Phase 7 Agent Router (SPEC §12). It implements the
 	// orchestrator's classification seam and drives router-selected pipelines.
 	// Per-role provider resolution is config-driven; the single adapter serves
-	// every role's ProviderConfig (multi-kind adapter routing lands later).
-	//
-	// TODO(integration): wire validationPipeline into the router as the SPEC
-	// §12.4 step-5 Validator. The router.Validator seam (Run(ctx, workspace,
-	// role) error) and validation.Pipeline.Run(ctx, dir, turnIndex) differ; a
-	// small adapter mapping role→turn-index and applying fail_on_severity is
-	// needed before passing router.WithValidator(...). Until then validation is
-	// available via `conductor validation run` and the router runs nil-guarded.
+	// every role's ProviderConfig (multi-kind adapter routing lands later). The
+	// validation runner is wired as the SPEC §12.4 step-5 Validator.
 	agentRouter := router.New(
 		router.WithProvider(providerAdapter),
 		router.WithTracker(trackerAdapter),
+		router.WithValidator(validator),
 		router.WithConfig(configFn),
 		router.WithTemplates(templatesFn),
 		router.WithAudit(writer),
@@ -315,7 +311,11 @@ func runOrchestrator(
 	// command factory. Skipped when enforcement is disabled so the orchestrator
 	// behaves exactly as before this phase.
 	if cfg.Enforcement.Enabled {
-		enforcer, gcStop := wireEnforcer(ctx, rctx, cfg, configFn, writer)
+		var layers harness.LayerChecker
+		if knowledgeEngine != nil {
+			layers = knowledgeLayerChecker{eng: knowledgeEngine, configFn: configFn}
+		}
+		enforcer, gcStop := wireEnforcer(ctx, rctx, cfg, configFn, writer, layers)
 		if gcStop != nil {
 			defer gcStop()
 		}
@@ -333,20 +333,22 @@ func runOrchestrator(
 }
 
 // wireKnowledge constructs the Knowledge Engine (Phase 10) and reports its
-// knowledge_index_status (SPEC §4.1.11). When knowledge.enabled is false it is a
-// no-op returning the disabled status, leaving startup behavior unchanged. When
-// enabled it opens the store, indexes the workspace repos if index_on_startup is
-// set, and starts the fsnotify watcher if watch_for_changes is set.
+// knowledge_index_status (SPEC §4.1.11) along with the engine itself (nil when
+// disabled) so the Harness Enforcer can consume its layer-violation output. When
+// knowledge.enabled is false it is a no-op returning (nil, disabled), leaving
+// startup behavior unchanged. When enabled it opens the store, indexes the
+// workspace repos if index_on_startup is set, and starts the fsnotify watcher if
+// watch_for_changes is set.
 func wireKnowledge(
 	ctx context.Context, rctx *rootContext, cfg config.Config, writer *audit.Writer,
-) knowledge.IndexStatus {
+) (*knowledge.Engine, knowledge.IndexStatus) {
 	if !cfg.Knowledge.Enabled {
-		return knowledge.StatusDisabled
+		return nil, knowledge.StatusDisabled
 	}
 	store, err := knowledge.OpenStore(ctx, cfg.Knowledge, rctx.log)
 	if err != nil {
 		rctx.log.Warn().Err(err).Msg("knowledge engine disabled: store open failed")
-		return knowledge.StatusDisabled
+		return nil, knowledge.StatusDisabled
 	}
 
 	eng := knowledge.New(cfg.Knowledge, cfg.Project.ID,
@@ -369,7 +371,34 @@ func wireKnowledge(
 			}
 		}()
 	}
-	return eng.Status()
+	return eng, eng.Status()
+}
+
+// knowledgeLayerChecker adapts the Knowledge Engine to the harness Enforcer's
+// LayerChecker seam (SPEC §8.6 / §11.4), mapping knowledge.LayerViolation onto
+// harness.LayerViolationInput so harness does not import the knowledge package.
+type knowledgeLayerChecker struct {
+	eng      *knowledge.Engine
+	configFn func() config.Config
+}
+
+// LayerViolations runs the Knowledge Engine's cross-layer dependency check and
+// translates the results into the enforcer's input shape.
+func (k knowledgeLayerChecker) LayerViolations(ctx context.Context) ([]harness.LayerViolationInput, error) {
+	vs, err := k.eng.CheckLayerViolations(ctx, k.configFn().HarnessRules)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]harness.LayerViolationInput, 0, len(vs))
+	for _, v := range vs {
+		out = append(out, harness.LayerViolationInput{
+			FromPath:  v.FromPath,
+			FromLayer: v.FromLayer,
+			ToPath:    v.ToPath,
+			ToLayer:   v.ToLayer,
+		})
+	}
+	return out, nil
 }
 
 // wireDocStore constructs the Doc Store Manager (Phase 11) backed by the
@@ -427,16 +456,17 @@ func (s enforcerSeam) PreDispatch(ctx context.Context) (orchestrator.EnforcerSta
 
 // wireEnforcer constructs the Harness Enforcer and starts its scheduled GC cron.
 // Rule checks run in the workspace root via a dir-pinned command factory. The
-// returned stop func stops the GC scheduler; it is nil when no GC was scheduled.
+// layers argument (nil when knowledge is disabled) supplies the SPEC §8.6 / §11.4
+// layer-violation translation. The returned stop func stops the GC scheduler; it
+// is nil when no GC was scheduled.
 //
-// TODO(phase-12): wire a TrackerIssuer (GC issue create + dedup) and a
-// LayerChecker (knowledge.CheckLayerViolations) adapter. Both require either a
-// high-level tracker create-issue helper or returning the knowledge Engine from
-// wireKnowledge; until then GC runs the rules but creates no issues and layer
-// translation is exercised via unit tests + `conductor harness check`.
+// TODO(phase-13): wire a TrackerIssuer (GC issue create + dedup) once the tracker
+// adapter gains a write surface — this is the same capability the Phase 13
+// `conductor_tracker_mutate` tool provides. Until then GC runs the rules but
+// creates no issues (a no-op when no issuer is wired).
 func wireEnforcer(
 	ctx context.Context, rctx *rootContext, cfg config.Config,
-	configFn func() config.Config, writer *audit.Writer,
+	configFn func() config.Config, writer *audit.Writer, layers harness.LayerChecker,
 ) (*harness.Enforcer, func()) {
 	root := cfg.Workspace.Root
 	if root == "" {
@@ -448,11 +478,15 @@ func wireEnforcer(
 		harness.WithRunnerLogger(rctx.log),
 		harness.WithRunnerProjectID(cfg.Project.ID),
 	)
-	enforcer := harness.NewEnforcer(runner, configFn,
+	enforcerOpts := []harness.EnforcerOption{
 		harness.WithEnforcerAudit(writer),
 		harness.WithEnforcerLogger(rctx.log),
 		harness.WithEnforcerProjectID(cfg.Project.ID),
-	)
+	}
+	if layers != nil {
+		enforcerOpts = append(enforcerOpts, harness.WithEnforcerLayers(layers))
+	}
+	enforcer := harness.NewEnforcer(runner, configFn, enforcerOpts...)
 
 	rctx.log.Info().
 		Bool("drift_check_on_dispatch", cfg.Enforcement.DriftCheckOnDispatch).
@@ -486,4 +520,48 @@ func sortedTemplateRoles(def *harness.Definition) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// validationRunner adapts the Validation Pipeline (SPEC §15) to the router's
+// per-(workspace, role) Validator seam (SPEC §12.4 step 5). It builds a
+// workspace-pinned pipeline per call, persists results under the workspace's
+// .conductor/validation/<turn_index>.json with a monotonic per-workspace index,
+// and returns an error (failing the attempt) when the result trips the
+// configured fail_on_severity threshold.
+type validationRunner struct {
+	cfg       config.Validation
+	log       zerolog.Logger
+	audit     *audit.Writer
+	projectID string
+
+	mu    sync.Mutex
+	turns map[string]int
+}
+
+// Run executes the configured checks in the workspace after a role's turn.
+func (v *validationRunner) Run(ctx context.Context, workspacePath, role string) error {
+	if !v.cfg.Enabled || !v.cfg.RunAfterTurn {
+		return nil
+	}
+
+	v.mu.Lock()
+	idx := v.turns[workspacePath]
+	v.turns[workspacePath] = idx + 1
+	v.mu.Unlock()
+
+	pipeline := validation.New(v.cfg,
+		validation.WithLogger(v.log),
+		validation.WithAudit(v.audit),
+		validation.WithProjectID(v.projectID),
+		validation.WithCommandFactory(validation.NewDirCommandFactory(workspacePath)),
+	)
+	dir := filepath.Join(workspacePath, ".conductor", "validation")
+	res, err := pipeline.Run(ctx, dir, idx)
+	if err != nil {
+		return fmt.Errorf("validation run (role %s): %w", role, err)
+	}
+	if failed, reason := res.FailTurn(v.cfg.FailOnSeverity); failed {
+		return fmt.Errorf("validation failed after role %s: %s", role, reason)
+	}
+	return nil
 }
