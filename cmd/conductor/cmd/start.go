@@ -12,6 +12,7 @@ import (
 	"github.com/conductor-sh/conductor/internal/config"
 	"github.com/conductor-sh/conductor/internal/db"
 	"github.com/conductor-sh/conductor/internal/harness"
+	"github.com/conductor-sh/conductor/internal/knowledge"
 	"github.com/conductor-sh/conductor/internal/orchestrator"
 	"github.com/conductor-sh/conductor/internal/provider"
 	"github.com/conductor-sh/conductor/internal/tracker"
@@ -207,6 +208,14 @@ func runOrchestrator(
 		templates = def.PromptTemplates
 	}
 
+	// Construct and wire the Knowledge Engine (Phase 10). It is a standalone
+	// background service: when enabled we open its store, optionally index on
+	// startup, optionally start the incremental watcher, and report its
+	// knowledge_index_status. The Phase 13 tool and the Phase 6 poll-loop seam
+	// consume the engine later; here we own its lifecycle and log its status.
+	knowledgeStatus := wireKnowledge(ctx, rctx, cfg, writer)
+	rctx.log.Info().Str("knowledge_index_status", string(knowledgeStatus)).Msg("knowledge engine status")
+
 	o := orchestrator.New(
 		orchestrator.WithTracker(trackerAdapter),
 		orchestrator.WithWorkspaces(wsManager),
@@ -223,6 +232,46 @@ func runOrchestrator(
 	}
 	rctx.log.Info().Msg("orchestrator stopped")
 	return nil
+}
+
+// wireKnowledge constructs the Knowledge Engine (Phase 10) and reports its
+// knowledge_index_status (SPEC §4.1.11). When knowledge.enabled is false it is a
+// no-op returning the disabled status, leaving startup behavior unchanged. When
+// enabled it opens the store, indexes the workspace repos if index_on_startup is
+// set, and starts the fsnotify watcher if watch_for_changes is set.
+func wireKnowledge(
+	ctx context.Context, rctx *rootContext, cfg config.Config, writer *audit.Writer,
+) knowledge.IndexStatus {
+	if !cfg.Knowledge.Enabled {
+		return knowledge.StatusDisabled
+	}
+	store, err := knowledge.OpenStore(ctx, cfg.Knowledge, rctx.log)
+	if err != nil {
+		rctx.log.Warn().Err(err).Msg("knowledge engine disabled: store open failed")
+		return knowledge.StatusDisabled
+	}
+
+	eng := knowledge.New(cfg.Knowledge, cfg.Project.ID,
+		knowledge.WithStore(store),
+		knowledge.WithAudit(writer),
+		knowledge.WithLogger(rctx.log),
+	)
+
+	roots := workspaceRoots(cfg)
+	if cfg.Knowledge.IndexOnStartup {
+		if _, err := eng.Index(ctx, roots); err != nil {
+			rctx.log.Warn().Err(err).Msg("knowledge startup index failed")
+		}
+	}
+	if cfg.Knowledge.WatchForChanges {
+		w := knowledge.NewWatcher(eng, roots, knowledge.WithWatchLogger(rctx.log))
+		go func() {
+			if err := w.Start(ctx); err != nil {
+				rctx.log.Error().Err(err).Msg("knowledge watcher exited with error")
+			}
+		}()
+	}
+	return eng.Status()
 }
 
 // resolveProviderConfig returns the provider config for a role, falling back
