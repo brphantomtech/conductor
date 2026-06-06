@@ -27,15 +27,18 @@ type anthropicAdapter struct {
 	http    *http.Client
 	log     zerolog.Logger
 	baseURL string
+	sum     summarizer
 }
 
 // anthropicSession holds the per-session message history and accumulated
 // usage. Anthropic's messages payload is structurally distinct from
 // OpenAI's so we model it explicitly.
 type anthropicSession struct {
-	messages []anthropicMessage
-	usage    TokenUsage
-	warned   bool
+	messages  []anthropicMessage
+	usage     TokenUsage
+	warned    bool
+	compacted bool
+	system    string
 }
 
 // anthropicMessage is one user/assistant turn. content is a polymorphic
@@ -63,11 +66,17 @@ func newAnthropicAdapter(cfg config.ProviderConfig, opt options) *anthropicAdapt
 	if cfg.BaseURL != "" {
 		base = cfg.BaseURL
 	}
+	trimmed := strings.TrimRight(base, "/")
+	sum := opt.summarizer
+	if sum == nil {
+		sum = anthropicSummarizer{http: opt.httpClient, baseURL: trimmed}
+	}
 	return &anthropicAdapter{
 		cfg:     cfg,
 		http:    opt.httpClient,
 		log:     opt.logger,
-		baseURL: strings.TrimRight(base, "/"),
+		baseURL: trimmed,
+		sum:     sum,
 	}
 }
 
@@ -133,7 +142,13 @@ func (a *anthropicAdapter) turn(ctx context.Context, s *Session, prompt string, 
 		},
 	})
 
-	body, err := buildAnthropicBody(a.cfg, payload.messages, tools)
+	cfg := a.cfg
+	if payload.system != "" {
+		// A compaction summary replaces any configured system prompt.
+		cfg.ExtraParams = cloneExtraParams(cfg.ExtraParams)
+		cfg.ExtraParams["system"] = payload.system
+	}
+	body, err := buildAnthropicBody(cfg, payload.messages, tools)
 	if err != nil {
 		return nil, fmt.Errorf("provider: anthropic: marshal body: %w", err)
 	}
@@ -351,7 +366,50 @@ func (a *anthropicAdapter) pumpStream(ctx context.Context, sess *anthropicSessio
 			sess.warned = true
 			stream.emit(AgentEvent{Type: EventContextWarning, Usage: sess.usage})
 		}
+
+		if !sess.compacted && shouldCompact(a.cfg.ContextBudget, sess.usage) {
+			evt, newUsage, ok, err := applyCompaction(ctx, a.cfg, a.sum, sess, sess.usage)
+			switch {
+			case err != nil:
+				a.log.Warn().Err(err).Msg("context compaction failed")
+			case ok:
+				sess.compacted = true
+				sess.usage = newUsage
+				stream.emit(evt)
+			}
+		}
 	}
+}
+
+// transcript renders the message history for the summarization prompt.
+func (sess *anthropicSession) transcript() string {
+	var b strings.Builder
+	for _, m := range sess.messages {
+		for _, c := range m.Content {
+			if c.Type == "text" && c.Text != "" {
+				b.WriteString(m.Role)
+				b.WriteString(": ")
+				b.WriteString(c.Text)
+				b.WriteString("\n")
+			}
+		}
+	}
+	return b.String()
+}
+
+// restartWithSummary replaces the history with the summary system message.
+func (sess *anthropicSession) restartWithSummary(summary string) {
+	sess.system = summary
+	sess.messages = nil
+}
+
+// dropOldestPairs keeps the most recent keep messages (sliding_window).
+func (sess *anthropicSession) dropOldestPairs(keep int) {
+	pairs := keep * 2
+	if pairs <= 0 || len(sess.messages) <= pairs {
+		return
+	}
+	sess.messages = append([]anthropicMessage(nil), sess.messages[len(sess.messages)-pairs:]...)
 }
 
 // anthropicToolBuilder accumulates a tool_use block's input JSON across
@@ -366,6 +424,16 @@ type anthropicToolBuilder struct {
 type anthropicUsagePayload struct {
 	InputTokens  int `json:"input_tokens"`
 	OutputTokens int `json:"output_tokens"`
+}
+
+// cloneExtraParams copies the params map so a per-turn system override does
+// not mutate the adapter's shared config.
+func cloneExtraParams(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in)+1)
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func buildAnthropicBody(cfg config.ProviderConfig, messages []anthropicMessage, tools []ToolSpec) ([]byte, error) {

@@ -32,23 +32,25 @@ type openaiAdapter struct {
 	baseURL      string
 	authHeader   func(req *http.Request, apiKey string)
 	extraHeaders map[string]string
+	sum          summarizer
 }
 
 // openaiSession is the per-session state carried as Session.payload.
 type openaiSession struct {
-	messages []openaiMessage
-	usage    TokenUsage
-	warned   bool
+	messages  []openaiMessage
+	usage     TokenUsage
+	warned    bool
+	compacted bool
 }
 
 // openaiMessage mirrors the wire schema. content is left as json.RawMessage
 // so we can hold either a string or a structured tool_result array.
 type openaiMessage struct {
-	Role       string             `json:"role"`
-	Content    json.RawMessage    `json:"content,omitempty"`
-	Name       string             `json:"name,omitempty"`
-	ToolCalls  []openaiToolCall   `json:"tool_calls,omitempty"`
-	ToolCallID string             `json:"tool_call_id,omitempty"`
+	Role       string           `json:"role"`
+	Content    json.RawMessage  `json:"content,omitempty"`
+	Name       string           `json:"name,omitempty"`
+	ToolCalls  []openaiToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
 }
 
 type openaiToolCall struct {
@@ -78,14 +80,25 @@ func newOpenAIAdapter(
 	if cfg.BaseURL != "" {
 		baseURL = cfg.BaseURL
 	}
+	trimmed := strings.TrimRight(baseURL, "/")
+	sum := opt.summarizer
+	if sum == nil {
+		sum = openaiSummarizer{
+			http:         opt.httpClient,
+			baseURL:      trimmed,
+			authHeader:   authHeader,
+			extraHeaders: extraHeaders,
+		}
+	}
 	return &openaiAdapter{
 		cfg:          cfg,
 		http:         opt.httpClient,
 		log:          opt.logger,
 		providerName: providerName,
-		baseURL:      strings.TrimRight(baseURL, "/"),
+		baseURL:      trimmed,
 		authHeader:   authHeader,
 		extraHeaders: extraHeaders,
+		sum:          sum,
 	}
 }
 
@@ -290,7 +303,64 @@ func (a *openaiAdapter) pumpStream(ctx context.Context, sess *openaiSession, str
 			sess.warned = true
 			stream.emit(AgentEvent{Type: EventContextWarning, Usage: sess.usage})
 		}
+
+		if !sess.compacted && shouldCompact(a.cfg.ContextBudget, sess.usage) {
+			evt, newUsage, ok, err := applyCompaction(ctx, a.cfg, a.sum, sess, sess.usage)
+			switch {
+			case err != nil:
+				a.log.Warn().Err(err).Msg("context compaction failed")
+			case ok:
+				sess.compacted = true
+				sess.usage = newUsage
+				stream.emit(evt)
+			}
+		}
 	}
+}
+
+// transcript renders the message history for the summarization prompt.
+func (sess *openaiSession) transcript() string {
+	var b strings.Builder
+	for _, m := range sess.messages {
+		var text string
+		if len(m.Content) > 0 {
+			_ = json.Unmarshal(m.Content, &text)
+		}
+		if text == "" {
+			continue
+		}
+		b.WriteString(m.Role)
+		b.WriteString(": ")
+		b.WriteString(text)
+		b.WriteString("\n")
+	}
+	return b.String()
+}
+
+// restartWithSummary replaces the history with a single system message
+// carrying the summary (summarize strategy).
+func (sess *openaiSession) restartWithSummary(summary string) {
+	content, _ := json.Marshal(summary)
+	sess.messages = []openaiMessage{{Role: "system", Content: content}}
+}
+
+// dropOldestPairs keeps any leading system message plus the most recent keep
+// user/assistant pairs (sliding_window strategy).
+func (sess *openaiSession) dropOldestPairs(keep int) {
+	var system []openaiMessage
+	body := sess.messages
+	if len(body) > 0 && body[0].Role == "system" {
+		system = body[:1]
+		body = body[1:]
+	}
+	pairs := keep * 2
+	if pairs > 0 && len(body) > pairs {
+		body = body[len(body)-pairs:]
+	}
+	out := make([]openaiMessage, 0, len(system)+len(body))
+	out = append(out, system...)
+	out = append(out, body...)
+	sess.messages = out
 }
 
 // requiresAPIKey reports whether the resolved base URL points at a
@@ -374,9 +444,9 @@ type openaiChunk struct {
 }
 
 type openaiChunkChoice struct {
-	Index        int                `json:"index"`
-	Delta        openaiChunkDelta   `json:"delta"`
-	FinishReason string             `json:"finish_reason"`
+	Index        int              `json:"index"`
+	Delta        openaiChunkDelta `json:"delta"`
+	FinishReason string           `json:"finish_reason"`
 }
 
 type openaiChunkDelta struct {

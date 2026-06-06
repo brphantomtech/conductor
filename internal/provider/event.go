@@ -31,6 +31,21 @@ const (
 	// crosses 80% of ProviderConfig.ContextBudget. SPEC §7.4.
 	EventContextWarning EventType = "context_warning"
 
+	// EventContextCompacted fires when cumulative usage crosses 95% of the
+	// budget under compaction_strategy: summarize and the session context is
+	// restarted with a summary system message. SPEC §7.4.
+	EventContextCompacted EventType = "context_compacted"
+
+	// EventContextSlid fires when cumulative usage crosses 95% of the budget
+	// under compaction_strategy: sliding_window and the oldest message pairs
+	// are dropped. SPEC §7.4.
+	EventContextSlid EventType = "context_slid"
+
+	// EventContextLimitApproaching fires when cumulative usage crosses 95% of
+	// the budget under compaction_strategy: none. No compaction is performed.
+	// SPEC §7.4.
+	EventContextLimitApproaching EventType = "context_limit_approaching"
+
 	// EventError carries a terminal stream error. The events channel is
 	// closed immediately after this event is emitted.
 	EventError EventType = "error"

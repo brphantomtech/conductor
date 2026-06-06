@@ -47,6 +47,7 @@ type options struct {
 	httpClient *http.Client
 	logger     zerolog.Logger
 	clock      func() time.Time
+	summarizer summarizer
 }
 
 // defaultOptions returns the production defaults. The HTTP client has no
@@ -88,6 +89,17 @@ func WithClock(f func() time.Time) Option {
 	return func(o *options) {
 		if f != nil {
 			o.clock = f
+		}
+	}
+}
+
+// WithSummarizer overrides the default provider-call summarizer used by the
+// compaction_strategy: summarize path (SPEC §7.4). Tests inject a
+// deterministic summarizer so compaction never makes a live API call.
+func WithSummarizer(s summarizer) Option {
+	return func(o *options) {
+		if s != nil {
+			o.summarizer = s
 		}
 	}
 }
