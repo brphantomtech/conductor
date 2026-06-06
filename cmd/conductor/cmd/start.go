@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/robfig/cron/v3"
 	"github.com/spf13/cobra"
 
 	"github.com/conductor-sh/conductor/internal/audit"
@@ -292,6 +293,19 @@ func runOrchestrator(
 		orchOpts = append(orchOpts, orchestrator.WithMemoryPostProcessor(memory.NewPostProcessor(mgr)))
 	}
 
+	// Wire the Phase 12 Harness Enforcer (SPEC §11). The enforcer implements the
+	// orchestrator's EnforcerCheck seam (pre-dispatch drift check) and runs the
+	// scheduled GC cron. Rule checks run in the workspace root via a dir-pinned
+	// command factory. Skipped when enforcement is disabled so the orchestrator
+	// behaves exactly as before this phase.
+	if cfg.Enforcement.Enabled {
+		enforcer, gcStop := wireEnforcer(ctx, rctx, cfg, configFn, writer)
+		if gcStop != nil {
+			defer gcStop()
+		}
+		orchOpts = append(orchOpts, orchestrator.WithEnforcer(enforcerSeam{enforcer}))
+	}
+
 	o := orchestrator.New(orchOpts...)
 
 	rctx.log.Info().Msg("orchestrator started")
@@ -340,6 +354,61 @@ func wireKnowledge(
 		}()
 	}
 	return eng.Status()
+}
+
+// enforcerSeam adapts the harness Enforcer to the orchestrator's EnforcerCheck
+// seam, mapping harness.EnforcerStatus onto orchestrator.EnforcerStatus (the two
+// share string values; the adapter avoids harness importing the orchestrator).
+type enforcerSeam struct {
+	e *harness.Enforcer
+}
+
+// PreDispatch runs the harness pre-dispatch check and maps its status.
+func (s enforcerSeam) PreDispatch(ctx context.Context) (orchestrator.EnforcerStatus, error) {
+	st, err := s.e.PreDispatch(ctx)
+	return orchestrator.EnforcerStatus(string(st)), err
+}
+
+// wireEnforcer constructs the Harness Enforcer and starts its scheduled GC cron.
+// Rule checks run in the workspace root via a dir-pinned command factory. The
+// returned stop func stops the GC scheduler; it is nil when no GC was scheduled.
+//
+// TODO(phase-12): wire a TrackerIssuer (GC issue create + dedup) and a
+// LayerChecker (knowledge.CheckLayerViolations) adapter. Both require either a
+// high-level tracker create-issue helper or returning the knowledge Engine from
+// wireKnowledge; until then GC runs the rules but creates no issues and layer
+// translation is exercised via unit tests + `conductor harness check`.
+func wireEnforcer(
+	ctx context.Context, rctx *rootContext, cfg config.Config,
+	configFn func() config.Config, writer *audit.Writer,
+) (*harness.Enforcer, func()) {
+	root := cfg.Workspace.Root
+	if root == "" {
+		root = "."
+	}
+	runner := harness.NewRunner(
+		harness.NewDirCommandFactory(root),
+		harness.WithRunnerAudit(writer),
+		harness.WithRunnerLogger(rctx.log),
+		harness.WithRunnerProjectID(cfg.Project.ID),
+	)
+	enforcer := harness.NewEnforcer(runner, configFn,
+		harness.WithEnforcerAudit(writer),
+		harness.WithEnforcerLogger(rctx.log),
+		harness.WithEnforcerProjectID(cfg.Project.ID),
+	)
+
+	rctx.log.Info().
+		Bool("drift_check_on_dispatch", cfg.Enforcement.DriftCheckOnDispatch).
+		Str("gc_schedule_cron", cfg.Enforcement.GCScheduleCron).
+		Msg("harness enforcer ready")
+
+	c := cron.New()
+	if err := enforcer.StartGC(ctx, c); err != nil {
+		rctx.log.Warn().Err(err).Msg("harness enforcer: gc schedule failed")
+		return enforcer, nil
+	}
+	return enforcer, func() { c.Stop() }
 }
 
 // resolveProviderConfig returns the provider config for a role, falling back

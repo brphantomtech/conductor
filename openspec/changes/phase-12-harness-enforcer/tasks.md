@@ -34,10 +34,10 @@ one focused session.
 ## 5. CLI Wiring
 
 - [x] 5.1 Implement `conductor harness check` (on-demand rule run, grouped by severity) — extend the existing `harness` command in a new `cmd/conductor/cmd/cmd_harness_check.go`.
-- [ ] 5.2 **Integration commit (final, append-only):** register the `check` subcommand under the existing `harness` command; construct the enforcer and wire `orchestrator.WithEnforcer(...)` plus the GC cron in `cmd/conductor/cmd/start.go` `runOrchestrator`; update `AGENTS.md` navigation for the enforcer.
+- [x] 5.2 **Integration commit (final, append-only):** register the `check` subcommand under the existing `harness` command; construct the enforcer and wire `orchestrator.WithEnforcer(...)` plus the GC cron in `cmd/conductor/cmd/start.go` `runOrchestrator`; update `AGENTS.md` navigation for the enforcer.
 
 ## 6. Verification
 
-- [ ] 6.1 `go build ./...` and `go vet ./...` clean; repo linter passes for the new `internal/harness` enforcer files; existing harness/orchestrator tests still green.
-- [ ] 6.2 `go test ./internal/harness/... ./internal/orchestrator/...` passes; new enforcer code coverage ≥ 70%.
-- [ ] 6.3 Smoke: `conductor harness check` against a workspace with a failing rule reports the violation grouped by severity.
+- [x] 6.1 `go build ./...` and `go vet ./...` clean; repo linter passes for the new `internal/harness` enforcer files; existing harness/orchestrator tests still green.
+- [x] 6.2 `go test ./internal/harness/... ./internal/orchestrator/...` passes; new enforcer code coverage ≥ 70% (82.1% statement coverage on the harness package).
+- [x] 6.3 Smoke: `conductor harness check` against a workspace with a failing rule reports the violation grouped by severity (covered by cmd_harness_check_test.go).

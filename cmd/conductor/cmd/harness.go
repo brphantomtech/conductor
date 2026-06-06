@@ -20,15 +20,15 @@ const (
 	outputFormatJSON = "json"
 )
 
-// newHarnessCommand wires the `conductor harness ...` parent command. The
-// only subcommand active in Phase 2 is `validate`; `check` arrives in
-// Phase 12.
+// newHarnessCommand wires the `conductor harness ...` parent command. Phase 2
+// shipped `validate`; Phase 12 adds `check` (on-demand harness-rule run).
 func newHarnessCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "harness",
 		Short: "HARNESS.md validation and runtime inspection",
 	}
 	cmd.AddCommand(newHarnessValidateCommand())
+	cmd.AddCommand(newHarnessCheckCommand())
 	return cmd
 }
 
