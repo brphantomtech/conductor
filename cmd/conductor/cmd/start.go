@@ -11,6 +11,7 @@ import (
 	"github.com/conductor-sh/conductor/internal/audit"
 	"github.com/conductor-sh/conductor/internal/config"
 	"github.com/conductor-sh/conductor/internal/db"
+	"github.com/conductor-sh/conductor/internal/docstore"
 	"github.com/conductor-sh/conductor/internal/harness"
 	"github.com/conductor-sh/conductor/internal/knowledge"
 	"github.com/conductor-sh/conductor/internal/memory"
@@ -272,6 +273,21 @@ func runOrchestrator(
 		orchestrator.WithLogger(rctx.log),
 	}
 
+	// Wire the Doc Store Manager (Phase 11) as the orchestrator's DocStoreSync
+	// poll-loop seam (SPEC §10.3 step 4): each tick syncs pending stores,
+	// indexing changed documents as doc nodes. Skipped when docs are disabled so
+	// the poll loop behaves exactly as before this phase. Only local_fs stores
+	// are constructed here; git_repo/s3 need injected clients (SPEC §10.2).
+	if cfg.Docs.Enabled {
+		docMgr, dErr := wireDocStore(ctx, rctx, cfg, writer)
+		if dErr != nil {
+			return fmt.Errorf("start: construct doc store manager: %w", dErr)
+		}
+		if docMgr != nil {
+			orchOpts = append(orchOpts, orchestrator.WithDocStoreSync(docMgr))
+		}
+	}
+
 	// Wire the Memory Manager as reconciliation Part C (SPEC §13.5): each
 	// terminal run writes a session-end episodic memory. Skipped when memory
 	// is disabled so the orchestrator behaves exactly as before this phase.
@@ -340,6 +356,46 @@ func wireKnowledge(
 		}()
 	}
 	return eng.Status()
+}
+
+// wireDocStore constructs the Doc Store Manager (Phase 11) backed by the
+// Knowledge Engine store so synced documents are indexed as doc nodes. It
+// returns nil (and no error) when no usable store could be opened, so the
+// orchestrator runs without the seam rather than failing startup. The Knowledge
+// store the manager indexes into is opened independently of wireKnowledge's
+// engine; both target the same configured store_backend.
+func wireDocStore(
+	ctx context.Context, rctx *rootContext, cfg config.Config, writer *audit.Writer,
+) (*docstore.Manager, error) {
+	store, err := knowledge.OpenStore(ctx, cfg.Knowledge, rctx.log)
+	if err != nil {
+		rctx.log.Warn().Err(err).Msg("doc store manager: knowledge store open failed; docs not indexed")
+		store = nil
+	}
+
+	opts := []docstore.Option{
+		docstore.WithProjectID(cfg.Project.ID),
+		docstore.WithAudit(writer),
+		docstore.WithLogger(rctx.log),
+	}
+	if store != nil {
+		opts = append(opts,
+			docstore.WithKnowledgeStore(store),
+			docstore.WithEmbedder(docstore.NewHashEmbedder(docstore.DefaultEmbedDim)),
+		)
+	}
+	mgr, err := docstore.New(cfg.Docs, cfg.Project.ID, opts...)
+	if err != nil {
+		if store != nil {
+			_ = store.Close()
+		}
+		return nil, err
+	}
+	if err := mgr.Hydrate(ctx); err != nil {
+		rctx.log.Warn().Err(err).Msg("doc store manager: hydrate failed; first sync re-indexes all docs")
+	}
+	rctx.log.Info().Int("doc_stores", len(cfg.Docs.Stores)).Msg("doc store manager ready")
+	return mgr, nil
 }
 
 // resolveProviderConfig returns the provider config for a role, falling back

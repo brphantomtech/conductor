@@ -44,5 +44,6 @@ Frontend (SvelteKit, embedded into Go binary via `embed`):
 - Phase 7 Agent Router (issue classification, routing-rule pipeline selection, role-by-role pipeline execution with output hand-off, SPEC §16 prompt construction + budget truncation, continuation handling) → [internal/router/](internal/router/)
 - Phase 8 validation pipeline (per-turn shell-check runner with timeout/classification, atomic per-turn JSON persistence, fail_on_severity decision, context formatter, `conductor validation run`) → [internal/validation/](internal/validation/)
 - Phase 10 Knowledge Engine (seven-stage indexing pipeline, KnowledgeNode/KnowledgeEdge model, sqlite_vec store with qdrant behind a build tag, incremental fsnotify re-index, hybrid search, `## Codebase Context` formatter, layer-violation detection, `conductor knowledge` CLI) → [internal/knowledge/](internal/knowledge/)
+- Phase 11 Doc Store Manager (DocRef model, Backend extension point with local_fs/git_repo/s3 backends behind injected clients, checksum-based sync scheduler with last-good retention, doc-node indexing into the Knowledge Engine, `docs://` HARNESS resolver, `## Relevant Documentation` formatter, DocStoreSync seam, `conductor docs` CLI) → [internal/docstore/](internal/docstore/)
 
 This file is a map. It contains no rules. Rules and rationale live in `docs/`.
