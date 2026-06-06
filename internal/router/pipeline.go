@@ -8,6 +8,7 @@ import (
 	"github.com/conductor-sh/conductor/internal/audit"
 	"github.com/conductor-sh/conductor/internal/config"
 	"github.com/conductor-sh/conductor/internal/provider"
+	"github.com/conductor-sh/conductor/internal/tools"
 	"github.com/conductor-sh/conductor/internal/tracker"
 )
 
@@ -106,7 +107,7 @@ func (r *Router) runIteration(ctx context.Context, rc RunContext, iss tracker.Is
 
 		r.emitRole(ctx, audit.EventPipelineRoleStarted, rc, role, idx)
 
-		output, terr := r.runRoleTurn(ctx, roleCfg, rc.WorkspacePath, prompt, turn)
+		output, terr := r.runRoleTurn(ctx, roleCfg, rc, iss, role, prompt, turn)
 		if terr != nil {
 			r.emitRole(ctx, audit.EventPipelineRoleEnded, rc, role, idx, "outcome", "failed")
 			return "", terr
@@ -127,17 +128,19 @@ func (r *Router) runIteration(ctx context.Context, rc RunContext, iss tracker.Is
 }
 
 // runRoleTurn opens a session for the role's provider and runs a single turn.
-// On the first iteration it uses StartTurn; later iterations use ContinueTurn so
-// the original prompt is not re-sent (SPEC §16.3). A non-success result maps to
-// ErrTurnFailed wrapping the underlying cause so the orchestrator can classify
-// stall/cancel/timeout precisely.
+// On the first iteration it uses StartTurn (advertising the wired tools); later
+// iterations use ContinueTurn so the original prompt is not re-sent (SPEC §16.3).
+// When tools are wired and the model emits tool calls, it drives the tool-call
+// dispatch loop (SPEC §7.3) before returning the final text. A non-success
+// result maps to ErrTurnFailed wrapping the underlying cause so the orchestrator
+// can classify stall/cancel/timeout precisely.
 func (r *Router) runRoleTurn(
-	ctx context.Context, cfg config.ProviderConfig, workspacePath, prompt string, turn int,
+	ctx context.Context, cfg config.ProviderConfig, rc RunContext, iss tracker.Issue, role, prompt string, turn int,
 ) (string, error) {
 	if r.provider == nil {
 		return "", fmt.Errorf("%w: no provider configured", ErrTurnFailed)
 	}
-	sess, err := r.provider.CreateSession(ctx, cfg, workspacePath)
+	sess, err := r.provider.CreateSession(ctx, cfg, rc.WorkspacePath)
 	if err != nil {
 		return "", fmt.Errorf("router: create session: %w", err)
 	}
@@ -147,7 +150,7 @@ func (r *Router) runRoleTurn(
 	if turn > 1 {
 		stream, err = r.provider.ContinueTurn(ctx, sess, prompt)
 	} else {
-		stream, err = r.provider.StartTurn(ctx, sess, prompt, nil)
+		stream, err = r.provider.StartTurn(ctx, sess, prompt, r.toolSpecs())
 	}
 	if err != nil {
 		return "", fmt.Errorf("router: start turn: %w", err)
@@ -156,7 +159,83 @@ func (r *Router) runRoleTurn(
 	if res.Err != nil {
 		return "", fmt.Errorf("router: turn: %w", res.Err)
 	}
-	return res.Text, nil
+
+	return r.runToolLoop(ctx, sess, res, cfg, rc, iss, role)
+}
+
+// toolSpecs returns the wired registry's tool specs for injection into
+// StartTurn, or nil when no tools are wired (turn behaves as before).
+func (r *Router) toolSpecs() []provider.ToolSpec {
+	if r.toolRegistry == nil {
+		return nil
+	}
+	return r.toolRegistry.Specs()
+}
+
+// runToolLoop drives the SPEC §7.3 tool-call execution loop: while the latest
+// turn result carries tool calls, it dispatches each, continues the session with
+// the results, and repeats — bounded by maxToolTurns. A tool failure surfaces to
+// the model as an error result (handled by the dispatcher) rather than aborting.
+// When no tools are wired or the model called none, it returns the turn text
+// unchanged.
+func (r *Router) runToolLoop(
+	ctx context.Context, sess *provider.Session, res provider.TurnResult,
+	cfg config.ProviderConfig, rc RunContext, iss tracker.Issue, role string,
+) (string, error) {
+	if r.dispatcher == nil || len(res.ToolCalls) == 0 {
+		return res.Text, nil
+	}
+
+	policy := tools.NormalizePolicy(cfg.ApprovalPolicy)
+	ec := tools.ExecutionContext{
+		ProjectID:     r.configFn().Project.ID,
+		IssueID:       iss.ID,
+		AgentRole:     role,
+		SessionID:     sess.ID(),
+		WorkspacePath: rc.WorkspacePath,
+	}
+
+	lastText := res.Text
+	for i := 0; i < r.maxToolTurns; i++ {
+		results := make([]provider.ToolResult, 0, len(res.ToolCalls))
+		for _, call := range res.ToolCalls {
+			out := r.dispatcher.Dispatch(ctx, tools.Call{
+				ID:        call.ID,
+				Name:      call.Name,
+				Arguments: call.Arguments,
+			}, policy, ec)
+			results = append(results, provider.ToolResult{
+				CallID:  call.ID,
+				Name:    call.Name,
+				Content: tools.MarshalResult(out),
+				IsError: out.IsError,
+			})
+		}
+
+		stream, err := r.provider.ContinueWithToolResults(ctx, sess, results)
+		if err != nil {
+			return "", fmt.Errorf("router: continue with tool results: %w", err)
+		}
+		res = stream.Wait()
+		if res.Err != nil {
+			return "", fmt.Errorf("router: tool continuation turn: %w", res.Err)
+		}
+		if res.Text != "" {
+			lastText = res.Text
+		}
+		if len(res.ToolCalls) == 0 {
+			return lastText, nil
+		}
+	}
+
+	// Hit the cap with the model still calling tools: end with a diagnostic
+	// rather than looping forever (design.md "Tool loop runs forever").
+	r.log.Warn().
+		Str("issue_identifier", iss.Identifier).
+		Str("role", role).
+		Int("max_tool_turns", r.maxToolTurns).
+		Msg("router: tool-call loop reached cap; ending turn")
+	return lastText, nil
 }
 
 // runValidation invokes the Phase 8 Validation Pipeline at SPEC §12.4 step 5

@@ -22,6 +22,7 @@ import (
 	"github.com/conductor-sh/conductor/internal/orchestrator"
 	"github.com/conductor-sh/conductor/internal/provider"
 	"github.com/conductor-sh/conductor/internal/router"
+	"github.com/conductor-sh/conductor/internal/tools"
 	"github.com/conductor-sh/conductor/internal/tracker"
 	"github.com/conductor-sh/conductor/internal/validation"
 	"github.com/conductor-sh/conductor/internal/workspace"
@@ -243,15 +244,46 @@ func runOrchestrator(
 	configFn := func() config.Config { return cfg }
 	templatesFn := func() map[string]string { return templates }
 
+	// Wire the Memory Manager (Phase 9) ahead of the router so the Phase 13
+	// conductor_memory_* tools can dispatch to it. It is also wired as
+	// reconciliation Part C below. nil when memory is disabled.
+	memoryManager, memCleanup, mErr := wireMemory(ctx, rctx, cfg, writer)
+	if mErr != nil {
+		return mErr
+	}
+	if memCleanup != nil {
+		defer memCleanup()
+	}
+
+	// Build the Phase 13 tool registry (SPEC §7.3) from the wired engines and a
+	// dispatcher that emits redacted ToolCalled/ToolResult audit events. The
+	// router advertises these tools on every session and drives the dispatch
+	// loop. With no engines enabled the built-ins are still advertised but return
+	// unavailable results, keeping the tool surface stable.
+	toolRegistry := tools.NewRegistry()
+	toolRegistry.RegisterBuiltins(buildToolEngines(cfg, toolEngines{
+		tracker:    trackerAdapter,
+		knowledge:  knowledgeEngine,
+		memory:     memoryManager,
+		validation: cfg.Validation,
+	}))
+	toolDispatcher := tools.NewDispatcher(toolRegistry,
+		tools.WithAudit(writer),
+		tools.WithLogger(rctx.log),
+	)
+	rctx.log.Info().Int("tools", toolRegistry.Len()).Msg("tool registry ready")
+
 	// Construct the Phase 7 Agent Router (SPEC §12). It implements the
 	// orchestrator's classification seam and drives router-selected pipelines.
 	// Per-role provider resolution is config-driven; the single adapter serves
 	// every role's ProviderConfig (multi-kind adapter routing lands later). The
-	// validation runner is wired as the SPEC §12.4 step-5 Validator.
+	// validation runner is wired as the SPEC §12.4 step-5 Validator; the tool
+	// registry + dispatcher drive the SPEC §7.3 tool-call loop.
 	agentRouter := router.New(
 		router.WithProvider(providerAdapter),
 		router.WithTracker(trackerAdapter),
 		router.WithValidator(validator),
+		router.WithTools(toolRegistry, toolDispatcher),
 		router.WithConfig(configFn),
 		router.WithTemplates(templatesFn),
 		router.WithAudit(writer),
@@ -286,23 +318,10 @@ func runOrchestrator(
 	}
 
 	// Wire the Memory Manager as reconciliation Part C (SPEC §13.5): each
-	// terminal run writes a session-end episodic memory. Skipped when memory
-	// is disabled so the orchestrator behaves exactly as before this phase.
-	if cfg.Memory.Enabled {
-		consolidationCfg := resolveProviderConfig(cfg, cfg.Memory.ConsolidationProvider)
-		embedder := memory.NewAPIProvider(consolidationCfg, nil)
-		mgr, mErr := memory.New(ctx, cfg.Memory,
-			memory.WithProjectID(cfg.Project.ID),
-			memory.WithAudit(writer),
-			memory.WithLogger(rctx.log),
-			memory.WithEmbedder(embedder),
-			memory.WithSynthesizer(embedder),
-		)
-		if mErr != nil {
-			return fmt.Errorf("start: construct memory manager: %w", mErr)
-		}
-		defer func() { _ = mgr.Close() }()
-		orchOpts = append(orchOpts, orchestrator.WithMemoryPostProcessor(memory.NewPostProcessor(mgr)))
+	// terminal run writes a session-end episodic memory. The manager was
+	// constructed above (shared with the Phase 13 tools); nil when disabled.
+	if memoryManager != nil {
+		orchOpts = append(orchOpts, orchestrator.WithMemoryPostProcessor(memory.NewPostProcessor(memoryManager)))
 	}
 
 	// Wire the Phase 12 Harness Enforcer (SPEC §11). The enforcer implements the
@@ -315,7 +334,7 @@ func runOrchestrator(
 		if knowledgeEngine != nil {
 			layers = knowledgeLayerChecker{eng: knowledgeEngine, configFn: configFn}
 		}
-		enforcer, gcStop := wireEnforcer(ctx, rctx, cfg, configFn, writer, layers)
+		enforcer, gcStop := wireEnforcer(ctx, rctx, cfg, configFn, writer, layers, trackerAdapter)
 		if gcStop != nil {
 			defer gcStop()
 		}
@@ -372,6 +391,31 @@ func wireKnowledge(
 		}()
 	}
 	return eng, eng.Status()
+}
+
+// wireMemory constructs the Memory Manager (Phase 9) when memory is enabled,
+// returning the manager (nil when disabled), a cleanup func that closes it (nil
+// when disabled), and any construction error. It is wired once and shared by the
+// Phase 13 tools and the reconciliation Part-C post-processor.
+func wireMemory(
+	ctx context.Context, rctx *rootContext, cfg config.Config, writer *audit.Writer,
+) (*memory.Manager, func(), error) {
+	if !cfg.Memory.Enabled {
+		return nil, nil, nil
+	}
+	consolidationCfg := resolveProviderConfig(cfg, cfg.Memory.ConsolidationProvider)
+	embedder := memory.NewAPIProvider(consolidationCfg, nil)
+	mgr, err := memory.New(ctx, cfg.Memory,
+		memory.WithProjectID(cfg.Project.ID),
+		memory.WithAudit(writer),
+		memory.WithLogger(rctx.log),
+		memory.WithEmbedder(embedder),
+		memory.WithSynthesizer(embedder),
+	)
+	if err != nil {
+		return nil, nil, fmt.Errorf("start: construct memory manager: %w", err)
+	}
+	return mgr, func() { _ = mgr.Close() }, nil
 }
 
 // knowledgeLayerChecker adapts the Knowledge Engine to the harness Enforcer's
@@ -460,13 +504,15 @@ func (s enforcerSeam) PreDispatch(ctx context.Context) (orchestrator.EnforcerSta
 // layer-violation translation. The returned stop func stops the GC scheduler; it
 // is nil when no GC was scheduled.
 //
-// TODO(phase-13): wire a TrackerIssuer (GC issue create + dedup) once the tracker
-// adapter gains a write surface — this is the same capability the Phase 13
-// `conductor_tracker_mutate` tool provides. Until then GC runs the rules but
-// creates no issues (a no-op when no issuer is wired).
+// The Phase 12 GC TrackerIssuer (GC issue create + dedup) is wired here over the
+// tracker adapter's write surface — the same surface the Phase 13
+// conductor_tracker_mutate tool uses — closing the deferred follow-up. GitHub is
+// fully implemented; for trackers without an issuer (see newTrackerIssuer) GC
+// runs the rules but creates no issues.
 func wireEnforcer(
 	ctx context.Context, rctx *rootContext, cfg config.Config,
 	configFn func() config.Config, writer *audit.Writer, layers harness.LayerChecker,
+	trackerAdapter tracker.Adapter,
 ) (*harness.Enforcer, func()) {
 	root := cfg.Workspace.Root
 	if root == "" {
@@ -485,6 +531,13 @@ func wireEnforcer(
 	}
 	if layers != nil {
 		enforcerOpts = append(enforcerOpts, harness.WithEnforcerLayers(layers))
+	}
+	if issuer := newTrackerIssuer(cfg, trackerAdapter); issuer != nil {
+		enforcerOpts = append(enforcerOpts, harness.WithEnforcerTracker(issuer))
+		rctx.log.Info().Str("tracker_kind", cfg.Tracker.Kind).Msg("harness gc tracker issuer wired")
+	} else {
+		rctx.log.Info().Str("tracker_kind", cfg.Tracker.Kind).
+			Msg("harness gc tracker issuer not implemented for this tracker; gc creates no issues")
 	}
 	enforcer := harness.NewEnforcer(runner, configFn, enforcerOpts...)
 

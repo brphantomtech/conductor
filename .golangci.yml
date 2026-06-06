@@ -198,6 +198,26 @@ linters-settings:
           - pkg: github.com/conductor-sh/conductor/internal/router
           - pkg: github.com/conductor-sh/conductor/internal/orchestrator
           - pkg: github.com/conductor-sh/conductor/internal/api
+          - pkg: github.com/conductor-sh/conductor/internal/tools
+
+      # internal/tools (Phase 13) is a T2 cross-cutting consumer: it declares its
+      # own consumer-side engine interfaces and depends only on T0/T1 (config,
+      # provider, audit). It must not import the concrete domain engines, the
+      # router, the orchestrator, or the api.
+      tier-2-tools:
+        list-mode: lax
+        files:
+          - "internal/tools/**"
+        deny:
+          - pkg: github.com/conductor-sh/conductor/internal/harness
+          - pkg: github.com/conductor-sh/conductor/internal/knowledge
+          - pkg: github.com/conductor-sh/conductor/internal/memory
+          - pkg: github.com/conductor-sh/conductor/internal/validation
+          - pkg: github.com/conductor-sh/conductor/internal/docstore
+          - pkg: github.com/conductor-sh/conductor/internal/tracker
+          - pkg: github.com/conductor-sh/conductor/internal/router
+          - pkg: github.com/conductor-sh/conductor/internal/orchestrator
+          - pkg: github.com/conductor-sh/conductor/internal/api
 
       # ---------------- Tier 3: router ----------------
       tier-3-router:

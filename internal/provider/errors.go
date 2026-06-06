@@ -44,6 +44,12 @@ var (
 // it's a programmer-error guard distinct from the on-wire error set.
 var ErrSessionClosed = errors.New("provider_session_closed")
 
+// ErrNoToolCall signals that ContinueWithToolResults was called on a session
+// whose last assistant turn did not emit a tool call, so there is nothing for
+// the tool results to thread back to. A programmer-error guard, not a SPEC
+// §23.3 classification.
+var ErrNoToolCall = errors.New("provider_no_tool_call")
+
 // joinErrs is the canonical way adapters wrap a transport-layer cause
 // with one of the SPEC §23.3 sentinels so callers can both read the
 // underlying message and match on the classification.

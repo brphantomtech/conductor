@@ -123,6 +123,37 @@ func (a *openaiAdapter) ContinueTurn(ctx context.Context, s *Session, prompt str
 	return a.turn(ctx, s, prompt, nil)
 }
 
+// ContinueWithToolResults satisfies Adapter.ContinueWithToolResults. It appends
+// one `role:"tool"` message per result (threaded on tool_call_id) and runs a
+// follow-up turn. This is the shared OpenAI-compatible path used by OpenAI,
+// OpenRouter, and any wire-compatible derivative. It errors when the last
+// assistant message carried no tool_calls.
+func (a *openaiAdapter) ContinueWithToolResults(
+	ctx context.Context, s *Session, results []ToolResult,
+) (TurnStream, error) {
+	payload, err := a.prepareSession(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	if !lastOpenAITurnHasToolCall(payload.messages) {
+		return nil, fmt.Errorf("provider: %s: tool results: %w", a.providerName, ErrNoToolCall)
+	}
+
+	for _, res := range results {
+		content := res.Content
+		if len(content) == 0 {
+			content = json.RawMessage(`""`)
+		}
+		payload.messages = append(payload.messages, openaiMessage{
+			Role:       "tool",
+			ToolCallID: res.CallID,
+			Name:       res.Name,
+			Content:    content,
+		})
+	}
+	return a.sendTurn(ctx, payload, nil)
+}
+
 // EndSession satisfies Adapter.EndSession.
 func (a *openaiAdapter) EndSession(_ context.Context, s *Session) error {
 	if s == nil {
@@ -148,6 +179,21 @@ func (a *openaiAdapter) GetUsage(s *Session) TokenUsage {
 // the request body, opens the HTTP stream, and hands the body to a
 // background goroutine that publishes AgentEvents on the returned stream.
 func (a *openaiAdapter) turn(ctx context.Context, s *Session, prompt string, tools []ToolSpec) (TurnStream, error) {
+	payload, err := a.prepareSession(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	userContent, _ := json.Marshal(prompt)
+	payload.messages = append(payload.messages, openaiMessage{
+		Role:    "user",
+		Content: userContent,
+	})
+	return a.sendTurn(ctx, payload, tools)
+}
+
+// prepareSession validates the session state and returns its payload. Shared by
+// the text-turn and tool-result-continuation entry points.
+func (a *openaiAdapter) prepareSession(ctx context.Context, s *Session) (*openaiSession, error) {
 	if s == nil {
 		return nil, fmt.Errorf("provider: %s: turn: nil session: %w", a.providerName, ErrSessionClosed)
 	}
@@ -157,18 +203,17 @@ func (a *openaiAdapter) turn(ctx context.Context, s *Session, prompt string, too
 	if err := ctx.Err(); err != nil {
 		return nil, wrapTimeout(a.providerName, "turn", err)
 	}
-
 	payload, ok := s.loadPayload().(*openaiSession)
 	if !ok || payload == nil {
 		return nil, fmt.Errorf("provider: %s: turn: session payload missing: %w", a.providerName, ErrSessionClosed)
 	}
+	return payload, nil
+}
 
-	userContent, _ := json.Marshal(prompt)
-	payload.messages = append(payload.messages, openaiMessage{
-		Role:    "user",
-		Content: userContent,
-	})
-
+// sendTurn builds the request body from the session's current message history,
+// opens the HTTP stream, and pumps it. Callers append the user/tool message
+// before invoking it.
+func (a *openaiAdapter) sendTurn(ctx context.Context, payload *openaiSession, tools []ToolSpec) (TurnStream, error) {
 	body, err := buildOpenAIBody(a.cfg, payload.messages, tools)
 	if err != nil {
 		return nil, fmt.Errorf("provider: %s: marshal body: %w", a.providerName, err)
@@ -276,7 +321,7 @@ func (a *openaiAdapter) pumpStream(ctx context.Context, sess *openaiSession, str
 		stream.emit(AgentEvent{Type: EventToolCall, ToolCall: call})
 	}
 
-	if assistantContent.Len() > 0 || len(toolBuilders.calls) > 0 {
+	if assistantContent.Len() > 0 || len(toolBuilders.completed) > 0 {
 		ac := openaiMessage{Role: "assistant"}
 		if assistantContent.Len() > 0 {
 			b, _ := json.Marshal(assistantContent.String())
@@ -361,6 +406,18 @@ func (sess *openaiSession) dropOldestPairs(keep int) {
 	out = append(out, system...)
 	out = append(out, body...)
 	sess.messages = out
+}
+
+// lastOpenAITurnHasToolCall reports whether the most recent assistant message
+// carried tool_calls — the precondition for a tool-result continuation.
+func lastOpenAITurnHasToolCall(messages []openaiMessage) bool {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "assistant" {
+			continue
+		}
+		return len(messages[i].ToolCalls) > 0
+	}
+	return false
 }
 
 // requiresAPIKey reports whether the resolved base URL points at a

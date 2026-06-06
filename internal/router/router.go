@@ -10,6 +10,7 @@ import (
 	"github.com/conductor-sh/conductor/internal/config"
 	"github.com/conductor-sh/conductor/internal/harness"
 	"github.com/conductor-sh/conductor/internal/provider"
+	"github.com/conductor-sh/conductor/internal/tools"
 	"github.com/conductor-sh/conductor/internal/tracker"
 )
 
@@ -38,8 +39,31 @@ type Provider interface {
 		ctx context.Context, s *provider.Session, prompt string, tools []provider.ToolSpec,
 	) (provider.TurnStream, error)
 	ContinueTurn(ctx context.Context, s *provider.Session, prompt string) (provider.TurnStream, error)
+	ContinueWithToolResults(
+		ctx context.Context, s *provider.Session, results []provider.ToolResult,
+	) (provider.TurnStream, error)
 	EndSession(ctx context.Context, s *provider.Session) error
 }
+
+// ToolDispatcher is the subset of the tool-injection layer (Phase 13) the router
+// drives in its tool-call loop. *tools.Dispatcher satisfies it; tests inject a
+// fake. It is declared here (consumer side) so the router depends on the
+// behavior, not the concrete dispatcher.
+type ToolDispatcher interface {
+	Dispatch(ctx context.Context, call tools.Call, policy tools.ApprovalPolicy, ec tools.ExecutionContext) tools.ToolResult
+}
+
+// ToolRegistry is the subset of the tool registry the router reads to advertise
+// tools on StartTurn. *tools.Registry satisfies it.
+type ToolRegistry interface {
+	Specs() []provider.ToolSpec
+}
+
+// defaultMaxToolTurns bounds the per-role tool-call loop so a model that keeps
+// calling tools cannot loop forever (design.md "Tool-turn cap"). SPEC §7.3 is
+// silent on the value; 10 is a conservative default revisited if real runs need
+// tuning.
+const defaultMaxToolTurns = 10
 
 // Tracker is the subset of the tracker adapter the router consumes to re-fetch
 // issue state during continuation handling (SPEC §12.5).
@@ -63,14 +87,17 @@ type renderFunc func(source string, vars map[string]any) (string, error)
 // Router is the Agent Router (SPEC §12). It is constructed once with its
 // collaborators and reused across dispatches; it holds no per-issue state.
 type Router struct {
-	provider   Provider
-	tracker    Tracker
-	validator  Validator
-	configFn   func() config.Config
-	templateFn func() map[string]string
-	render     renderFunc
-	audit      *audit.Writer
-	log        zerolog.Logger
+	provider     Provider
+	tracker      Tracker
+	validator    Validator
+	toolRegistry ToolRegistry
+	dispatcher   ToolDispatcher
+	maxToolTurns int
+	configFn     func() config.Config
+	templateFn   func() map[string]string
+	render       renderFunc
+	audit        *audit.Writer
+	log          zerolog.Logger
 }
 
 // Option configures a Router at construction.
@@ -120,6 +147,29 @@ func WithRenderer(fn renderFunc) Option {
 	}
 }
 
+// WithTools wires the Phase 13 tool registry and dispatcher. When both are set,
+// the router advertises the registry's tools on each role's StartTurn and drives
+// the tool-call dispatch loop. When unset, turns run exactly as before (no tools
+// advertised, no loop).
+func WithTools(registry ToolRegistry, dispatcher ToolDispatcher) Option {
+	return func(r *Router) {
+		if registry != nil && dispatcher != nil {
+			r.toolRegistry = registry
+			r.dispatcher = dispatcher
+		}
+	}
+}
+
+// WithMaxToolTurns overrides the per-role tool-call loop cap (default 10). A
+// non-positive value leaves the default in place.
+func WithMaxToolTurns(n int) Option {
+	return func(r *Router) {
+		if n > 0 {
+			r.maxToolTurns = n
+		}
+	}
+}
+
 // WithAudit wires the audit writer. Without it, router events are dropped.
 func WithAudit(w *audit.Writer) Option { return func(r *Router) { r.audit = w } }
 
@@ -131,10 +181,11 @@ func WithLogger(l zerolog.Logger) Option { return func(r *Router) { r.log = l } 
 // prompt assembly).
 func New(opts ...Option) *Router {
 	r := &Router{
-		configFn:   func() config.Config { return config.Defaults() },
-		templateFn: func() map[string]string { return map[string]string{} },
-		render:     harness.Render,
-		log:        zerolog.Nop(),
+		configFn:     func() config.Config { return config.Defaults() },
+		templateFn:   func() map[string]string { return map[string]string{} },
+		render:       harness.Render,
+		maxToolTurns: defaultMaxToolTurns,
+		log:          zerolog.Nop(),
 	}
 	for _, opt := range opts {
 		if opt != nil {

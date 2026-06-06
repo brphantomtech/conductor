@@ -59,6 +59,7 @@ type anthropicContent struct {
 	Input     json.RawMessage `json:"input,omitempty"`
 	ToolUseID string          `json:"tool_use_id,omitempty"`
 	Content   json.RawMessage `json:"content,omitempty"`
+	IsError   bool            `json:"is_error,omitempty"`
 }
 
 func newAnthropicAdapter(cfg config.ProviderConfig, opt options) *anthropicAdapter {
@@ -98,6 +99,38 @@ func (a *anthropicAdapter) ContinueTurn(ctx context.Context, s *Session, prompt 
 	return a.turn(ctx, s, prompt, nil)
 }
 
+// ContinueWithToolResults satisfies Adapter.ContinueWithToolResults. It appends
+// a user message of `tool_result` content blocks (one per result, threaded on
+// tool_use_id) and runs a follow-up turn. It errors when the last assistant
+// message carried no tool_use block.
+func (a *anthropicAdapter) ContinueWithToolResults(
+	ctx context.Context, s *Session, results []ToolResult,
+) (TurnStream, error) {
+	payload, err := a.prepareSession(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	if !lastAnthropicTurnHasToolUse(payload.messages) {
+		return nil, fmt.Errorf("provider: anthropic: tool results: %w", ErrNoToolCall)
+	}
+
+	blocks := make([]anthropicContent, 0, len(results))
+	for _, res := range results {
+		content := res.Content
+		if len(content) == 0 {
+			content = json.RawMessage(`""`)
+		}
+		blocks = append(blocks, anthropicContent{
+			Type:      "tool_result",
+			ToolUseID: res.CallID,
+			Content:   content,
+			IsError:   res.IsError,
+		})
+	}
+	payload.messages = append(payload.messages, anthropicMessage{Role: "user", Content: blocks})
+	return a.sendTurn(ctx, payload, nil)
+}
+
 // EndSession satisfies Adapter.EndSession.
 func (a *anthropicAdapter) EndSession(_ context.Context, s *Session) error {
 	if s == nil {
@@ -120,6 +153,22 @@ func (a *anthropicAdapter) GetUsage(s *Session) TokenUsage {
 }
 
 func (a *anthropicAdapter) turn(ctx context.Context, s *Session, prompt string, tools []ToolSpec) (TurnStream, error) {
+	payload, err := a.prepareSession(ctx, s)
+	if err != nil {
+		return nil, err
+	}
+	payload.messages = append(payload.messages, anthropicMessage{
+		Role: "user",
+		Content: []anthropicContent{
+			{Type: "text", Text: prompt},
+		},
+	})
+	return a.sendTurn(ctx, payload, tools)
+}
+
+// prepareSession validates the session state and returns its payload. Shared by
+// the text-turn and tool-result-continuation entry points.
+func (a *anthropicAdapter) prepareSession(ctx context.Context, s *Session) (*anthropicSession, error) {
 	if s == nil {
 		return nil, fmt.Errorf("provider: anthropic: turn: nil session: %w", ErrSessionClosed)
 	}
@@ -129,19 +178,17 @@ func (a *anthropicAdapter) turn(ctx context.Context, s *Session, prompt string, 
 	if err := ctx.Err(); err != nil {
 		return nil, wrapTimeout("anthropic", "turn", err)
 	}
-
 	payload, ok := s.loadPayload().(*anthropicSession)
 	if !ok || payload == nil {
 		return nil, fmt.Errorf("provider: anthropic: turn: session payload missing: %w", ErrSessionClosed)
 	}
+	return payload, nil
+}
 
-	payload.messages = append(payload.messages, anthropicMessage{
-		Role: "user",
-		Content: []anthropicContent{
-			{Type: "text", Text: prompt},
-		},
-	})
-
+// sendTurn builds the request body from the session's current message history,
+// opens the HTTP stream, and pumps it. Callers append the user message (text or
+// tool_result blocks) before invoking it.
+func (a *anthropicAdapter) sendTurn(ctx context.Context, payload *anthropicSession, tools []ToolSpec) (TurnStream, error) {
 	cfg := a.cfg
 	if payload.system != "" {
 		// A compaction summary replaces any configured system prompt.
@@ -492,6 +539,24 @@ func growTo(s *[]strings.Builder, n int) {
 	for len(*s) < n {
 		*s = append(*s, strings.Builder{})
 	}
+}
+
+// lastAnthropicTurnHasToolUse reports whether the most recent assistant message
+// in the history carried a tool_use block — the precondition for a tool-result
+// continuation.
+func lastAnthropicTurnHasToolUse(messages []anthropicMessage) bool {
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role != "assistant" {
+			continue
+		}
+		for _, c := range messages[i].Content {
+			if c.Type == "tool_use" {
+				return true
+			}
+		}
+		return false
+	}
+	return false
 }
 
 func growTo2(s *[]*anthropicToolBuilder, n int) {

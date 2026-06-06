@@ -75,6 +75,14 @@ func (a *openrouterAdapter) ContinueTurn(ctx context.Context, s *Session, prompt
 	return a.inner.ContinueTurn(ctx, s, prompt)
 }
 
+// ContinueWithToolResults forwards to the embedded openaiAdapter, sharing the
+// OpenAI-compatible `role:"tool"` tool-result path.
+func (a *openrouterAdapter) ContinueWithToolResults(
+	ctx context.Context, s *Session, results []ToolResult,
+) (TurnStream, error) {
+	return a.inner.ContinueWithToolResults(ctx, s, results)
+}
+
 // EndSession forwards to the embedded openaiAdapter.
 func (a *openrouterAdapter) EndSession(ctx context.Context, s *Session) error {
 	return a.inner.EndSession(ctx, s)

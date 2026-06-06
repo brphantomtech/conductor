@@ -123,15 +123,20 @@ type Providers struct {
 
 // ProviderConfig corresponds to SPEC §4.1.3.
 type ProviderConfig struct {
-	Provider           string         `yaml:"provider"            mapstructure:"provider"`
-	Model              string         `yaml:"model"               mapstructure:"model"`
-	APIKey             string         `yaml:"api_key"             mapstructure:"api_key"`
-	BaseURL            string         `yaml:"base_url"            mapstructure:"base_url"`
-	MaxTokens          int            `yaml:"max_tokens"          mapstructure:"max_tokens"`
-	Temperature        *float64       `yaml:"temperature"         mapstructure:"temperature"`
-	ContextBudget      int            `yaml:"context_budget"      mapstructure:"context_budget"`
-	CompactionStrategy string         `yaml:"compaction_strategy" mapstructure:"compaction_strategy"`
-	ExtraParams        map[string]any `yaml:"extra_params"        mapstructure:"extra_params"`
+	Provider           string   `yaml:"provider"            mapstructure:"provider"`
+	Model              string   `yaml:"model"               mapstructure:"model"`
+	APIKey             string   `yaml:"api_key"             mapstructure:"api_key"`
+	BaseURL            string   `yaml:"base_url"            mapstructure:"base_url"`
+	MaxTokens          int      `yaml:"max_tokens"          mapstructure:"max_tokens"`
+	Temperature        *float64 `yaml:"temperature"         mapstructure:"temperature"`
+	ContextBudget      int      `yaml:"context_budget"      mapstructure:"context_budget"`
+	CompactionStrategy string   `yaml:"compaction_strategy" mapstructure:"compaction_strategy"`
+	// ApprovalPolicy gates the agent's tool calls (SPEC §21.2): "auto"
+	// (default) auto-approves all; "review_destructive" gates destructive
+	// tracker mutations; "manual" gates every tool call. An empty value is
+	// treated as "auto".
+	ApprovalPolicy string         `yaml:"approval_policy"     mapstructure:"approval_policy"`
+	ExtraParams    map[string]any `yaml:"extra_params"        mapstructure:"extra_params"`
 }
 
 // Routing corresponds to SPEC §5.3.7.
