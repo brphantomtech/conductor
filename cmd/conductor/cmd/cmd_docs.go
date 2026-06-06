@@ -116,6 +116,11 @@ func runDocsSync(ctx context.Context, cmd *cobra.Command, flags *docsFlags) erro
 	defer cleanup()
 	_ = store
 
+	// Seed last-good state from persisted doc nodes so only changed documents
+	// are re-indexed across one-shot CLI runs.
+	if err := mgr.Hydrate(ctx); err != nil {
+		return fmt.Errorf("docs sync: %w", err)
+	}
 	if err := mgr.SyncAll(ctx); err != nil {
 		return fmt.Errorf("docs sync: %w", err)
 	}
@@ -143,7 +148,12 @@ func runDocsSearch(ctx context.Context, cmd *cobra.Command, flags *docsFlags, qu
 	}
 	defer cleanup()
 
-	eng := knowledge.New(cfg.Knowledge, cfg.Project.ID, knowledge.WithStore(store))
+	// Query with the same deterministic embedder used to index doc nodes so the
+	// semantic vectors align (no live embedding provider is wired in the CLI).
+	eng := knowledge.New(cfg.Knowledge, cfg.Project.ID,
+		knowledge.WithStore(store),
+		knowledge.WithEmbedder(docstore.NewHashEmbedder(docstore.DefaultEmbedDim)),
+	)
 	results, err := eng.Search(ctx, knowledge.SearchParams{
 		Query: query,
 		Types: []knowledge.NodeType{knowledge.NodeDoc},
@@ -179,6 +189,7 @@ func buildDocsManager(
 
 	mgr, err := docstore.New(cfg.Docs, cfg.Project.ID,
 		docstore.WithKnowledgeStore(store),
+		docstore.WithEmbedder(docstore.NewHashEmbedder(docstore.DefaultEmbedDim)),
 		docstore.WithAudit(writer),
 		docstore.WithLogger(log),
 	)

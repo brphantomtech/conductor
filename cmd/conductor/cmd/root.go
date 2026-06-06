@@ -64,6 +64,7 @@ func NewRootCommand() *cobra.Command {
 	root.AddCommand(newStartCommand(rctx))
 	root.AddCommand(newMemoryCommand())
 	root.AddCommand(newValidationCommand())
+	root.AddCommand(newDocsCommand())
 
 	return root
 }
