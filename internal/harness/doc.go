@@ -20,8 +20,21 @@
 //   - errors.go    — SPEC §23.1 sentinels plus the validator sub-class
 //     wrappers the CLI uses to categorize multi-error output.
 //
-// The HarnessRule runner, pre-dispatch drift check, and scheduled GC
-// worker arrive in Phase 12.
+// Phase 12 adds the enforcer half (SPEC §11):
+//
+//   - violation.go  — the Violation record + Severity classification.
+//   - runner.go     — the HarnessRule runner: each `check` runs in the
+//     workspace root under a timeout; non-zero exit → a severity-tagged
+//     violation; emits HarnessViolationDetected.
+//   - enforcer.go   — the Enforcer: PreDispatch implements the orchestrator's
+//     EnforcerCheck seam (SPEC §11.2) with the three severity behaviors incl.
+//     blocking-halt + cached debt/architectural prompt sections.
+//   - gc.go         — scheduled GC (SPEC §11.3): a robfig/cron job creates
+//     deduplicated tracker issues for auto_fix violations (GCTaskCreated).
+//   - layers.go     — Knowledge-Engine layer-violation translation into
+//     dependency-category violations (SPEC §8.6, §11.4).
+//   - formatters.go — the pure FormatTechnicalDebt / FormatArchitecturalIssues
+//     prompt-section formatters (SPEC §16.1 steps 7–8).
 //
 // Tier 2 (domain engine). Imports Tier 0 + Tier 1. Other Tier 2 packages
 // (knowledge, memory, validation, docstore) are wired in by Tier 3 (router)
