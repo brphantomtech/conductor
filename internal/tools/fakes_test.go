@@ -3,7 +3,23 @@ package tools
 import (
 	"context"
 	"errors"
+
+	"github.com/rs/zerolog"
+
+	"github.com/conductor-sh/conductor/internal/audit"
 )
+
+// noopLogger returns a discarded zerolog.Logger for tests.
+func noopLogger() zerolog.Logger { return zerolog.Nop() }
+
+// recSink adapts a recordingAudit into an audit.Sink so it can be attached to a
+// real audit.Writer (exercising the Phase 17 redactor path).
+type recSink struct{ rec *recordingAudit }
+
+func (s recSink) Write(ctx context.Context, evt audit.AuditEvent) error {
+	return s.rec.Write(ctx, evt)
+}
+func (s recSink) Close() error { return nil }
 
 // errEngine is a sentinel an engine fake returns to exercise error mapping.
 var errEngine = errors.New("engine boom")
