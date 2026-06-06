@@ -139,7 +139,7 @@ func (r *Router) runRoleTurn(
 	}
 	sess, err := r.provider.CreateSession(ctx, cfg, workspacePath)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("router: create session: %w", err)
 	}
 	defer func() { _ = r.provider.EndSession(context.WithoutCancel(ctx), sess) }()
 
@@ -150,11 +150,11 @@ func (r *Router) runRoleTurn(
 		stream, err = r.provider.StartTurn(ctx, sess, prompt, nil)
 	}
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("router: start turn: %w", err)
 	}
 	res := stream.Wait()
 	if res.Err != nil {
-		return "", res.Err
+		return "", fmt.Errorf("router: turn: %w", res.Err)
 	}
 	return res.Text, nil
 }
@@ -169,7 +169,10 @@ func (r *Router) runValidation(ctx context.Context, workspacePath, role string) 
 	if !r.configFn().Validation.RunAfterTurn {
 		return nil
 	}
-	return r.validator.Run(ctx, workspacePath, role)
+	if err := r.validator.Run(ctx, workspacePath, role); err != nil {
+		return fmt.Errorf("router: validation %q: %w", role, err)
+	}
+	return nil
 }
 
 // issueStillActive re-fetches the issue state from the tracker and reports
@@ -180,7 +183,7 @@ func (r *Router) issueStillActive(ctx context.Context, iss tracker.Issue, cfg co
 	}
 	states, err := r.tracker.FetchIssueStatesByIDs(ctx, []string{iss.ID})
 	if err != nil {
-		return false, err
+		return false, fmt.Errorf("router: re-fetch issue state %s: %w", iss.ID, err)
 	}
 	current, ok := states[iss.ID]
 	if !ok {

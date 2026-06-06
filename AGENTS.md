@@ -41,5 +41,6 @@ Frontend (SvelteKit, embedded into Go binary via `embed`):
 - Phase 1 + Phase 2 atomic task list → [TASKS.md](TASKS.md)
 - Phase 2 HARNESS.md loader (parser, validator, renderer, watcher) → [internal/harness/](internal/harness/)
 - Phase 6 orchestrator core (poll loop, runtime state, run-attempt lifecycle, candidate selection, retry/backoff, reconciliation, startup cleanup, single coder dispatch) → [internal/orchestrator/](internal/orchestrator/)
+- Phase 7 Agent Router (issue classification, routing-rule pipeline selection, role-by-role pipeline execution with output hand-off, SPEC §16 prompt construction + budget truncation, continuation handling) → [internal/router/](internal/router/)
 
 This file is a map. It contains no rules. Rules and rationale live in `docs/`.

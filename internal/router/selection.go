@@ -90,7 +90,9 @@ func containsFold(haystack []string, needle string) bool {
 	return false
 }
 
-func equalFold(a, b string) bool { return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b)) }
+func equalFold(a, b string) bool {
+	return strings.EqualFold(strings.TrimSpace(a), strings.TrimSpace(b))
+}
 
 func deref(p *string) string {
 	if p == nil {

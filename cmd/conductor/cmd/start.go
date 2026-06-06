@@ -14,6 +14,7 @@ import (
 	"github.com/conductor-sh/conductor/internal/harness"
 	"github.com/conductor-sh/conductor/internal/orchestrator"
 	"github.com/conductor-sh/conductor/internal/provider"
+	"github.com/conductor-sh/conductor/internal/router"
 	"github.com/conductor-sh/conductor/internal/tracker"
 	"github.com/conductor-sh/conductor/internal/workspace"
 )
@@ -207,13 +208,31 @@ func runOrchestrator(
 		templates = def.PromptTemplates
 	}
 
+	configFn := func() config.Config { return cfg }
+	templatesFn := func() map[string]string { return templates }
+
+	// Construct the Phase 7 Agent Router (SPEC §12). It implements the
+	// orchestrator's classification seam and drives router-selected pipelines.
+	// Per-role provider resolution is config-driven; the single adapter serves
+	// every role's ProviderConfig (multi-kind adapter routing lands later).
+	agentRouter := router.New(
+		router.WithProvider(providerAdapter),
+		router.WithTracker(trackerAdapter),
+		router.WithConfig(configFn),
+		router.WithTemplates(templatesFn),
+		router.WithAudit(writer),
+		router.WithLogger(rctx.log),
+	)
+
 	o := orchestrator.New(
 		orchestrator.WithTracker(trackerAdapter),
 		orchestrator.WithWorkspaces(wsManager),
 		orchestrator.WithProvider(providerAdapter, coderCfg),
 		orchestrator.WithAudit(writer),
-		orchestrator.WithConfig(func() config.Config { return cfg }),
-		orchestrator.WithTemplates(func() map[string]string { return templates }),
+		orchestrator.WithConfig(configFn),
+		orchestrator.WithTemplates(templatesFn),
+		orchestrator.WithClassifier(agentRouter),
+		orchestrator.WithPipelineRouter(agentRouter),
 		orchestrator.WithLogger(rctx.log),
 	)
 

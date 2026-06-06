@@ -16,9 +16,8 @@ func nopLogger() zerolog.Logger { return zerolog.Nop() }
 
 // recordedTurn captures one StartTurn/ContinueTurn invocation for assertions.
 type recordedTurn struct {
-	prompt     string
-	continued  bool
-	providerID string
+	prompt    string
+	continued bool
 }
 
 // fakeProvider is a filesystem-/network-free Provider with scripted turn
@@ -45,13 +44,10 @@ func (f *fakeProvider) nextResult() provider.TurnResult {
 	return r
 }
 
-func (f *fakeProvider) CreateSession(_ context.Context, cfg config.ProviderConfig, _ string) (*provider.Session, error) {
+func (f *fakeProvider) CreateSession(_ context.Context, _ config.ProviderConfig, _ string) (*provider.Session, error) {
 	if f.createErr != nil {
 		return nil, f.createErr
 	}
-	// Stash the provider id on the session via a sentinel workspace is not
-	// possible (Session is opaque); record on the turn instead.
-	_ = cfg
 	return &provider.Session{}, nil
 }
 

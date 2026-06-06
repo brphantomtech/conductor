@@ -34,7 +34,9 @@ const taskTypeUnknown = "unknown"
 // tests inject a fake.
 type Provider interface {
 	CreateSession(ctx context.Context, cfg config.ProviderConfig, workspace string) (*provider.Session, error)
-	StartTurn(ctx context.Context, s *provider.Session, prompt string, tools []provider.ToolSpec) (provider.TurnStream, error)
+	StartTurn(
+		ctx context.Context, s *provider.Session, prompt string, tools []provider.ToolSpec,
+	) (provider.TurnStream, error)
 	ContinueTurn(ctx context.Context, s *provider.Session, prompt string) (provider.TurnStream, error)
 	EndSession(ctx context.Context, s *provider.Session) error
 }
