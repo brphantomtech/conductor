@@ -10,6 +10,10 @@ The implementation does not aim to land all of Conductor at once. Phase 1 produc
 binary that loads HARNESS.md, validates config, and exits cleanly. Each subsequent phase adds
 one engine or surface and is independently testable.
 
+> **Building in parallel?** From Phase 7 onward, several phases can be developed concurrently in
+> separate git worktrees. See [parallel-execution-plan.md](./parallel-execution-plan.md) for the
+> waves, branch names, merge order, and the integration-commit rule that keeps conflicts trivial.
+
 ---
 
 ## Phase 1 — Foundation & Skeleton
