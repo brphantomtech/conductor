@@ -16,6 +16,7 @@ import (
 	"github.com/conductor-sh/conductor/internal/memory"
 	"github.com/conductor-sh/conductor/internal/orchestrator"
 	"github.com/conductor-sh/conductor/internal/provider"
+	"github.com/conductor-sh/conductor/internal/router"
 	"github.com/conductor-sh/conductor/internal/tracker"
 	"github.com/conductor-sh/conductor/internal/validation"
 	"github.com/conductor-sh/conductor/internal/workspace"
@@ -236,13 +237,38 @@ func runOrchestrator(
 	knowledgeStatus := wireKnowledge(ctx, rctx, cfg, writer)
 	rctx.log.Info().Str("knowledge_index_status", string(knowledgeStatus)).Msg("knowledge engine status")
 
+	configFn := func() config.Config { return cfg }
+	templatesFn := func() map[string]string { return templates }
+
+	// Construct the Phase 7 Agent Router (SPEC §12). It implements the
+	// orchestrator's classification seam and drives router-selected pipelines.
+	// Per-role provider resolution is config-driven; the single adapter serves
+	// every role's ProviderConfig (multi-kind adapter routing lands later).
+	//
+	// TODO(integration): wire validationPipeline into the router as the SPEC
+	// §12.4 step-5 Validator. The router.Validator seam (Run(ctx, workspace,
+	// role) error) and validation.Pipeline.Run(ctx, dir, turnIndex) differ; a
+	// small adapter mapping role→turn-index and applying fail_on_severity is
+	// needed before passing router.WithValidator(...). Until then validation is
+	// available via `conductor validation run` and the router runs nil-guarded.
+	agentRouter := router.New(
+		router.WithProvider(providerAdapter),
+		router.WithTracker(trackerAdapter),
+		router.WithConfig(configFn),
+		router.WithTemplates(templatesFn),
+		router.WithAudit(writer),
+		router.WithLogger(rctx.log),
+	)
+
 	orchOpts := []orchestrator.Option{
 		orchestrator.WithTracker(trackerAdapter),
 		orchestrator.WithWorkspaces(wsManager),
 		orchestrator.WithProvider(providerAdapter, coderCfg),
 		orchestrator.WithAudit(writer),
-		orchestrator.WithConfig(func() config.Config { return cfg }),
-		orchestrator.WithTemplates(func() map[string]string { return templates }),
+		orchestrator.WithConfig(configFn),
+		orchestrator.WithTemplates(templatesFn),
+		orchestrator.WithClassifier(agentRouter),
+		orchestrator.WithPipelineRouter(agentRouter),
 		orchestrator.WithLogger(rctx.log),
 	}
 
