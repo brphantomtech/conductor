@@ -50,6 +50,14 @@ func (f *routerFakeProvider) ContinueTurn(_ context.Context, _ *provider.Session
 	return &routerFakeStream{result: f.next()}, nil
 }
 
+func (f *routerFakeProvider) ContinueWithToolResults(
+	_ context.Context, _ *provider.Session, _ []provider.ToolResult,
+) (provider.TurnStream, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return &routerFakeStream{result: f.next()}, nil
+}
+
 func (f *routerFakeProvider) EndSession(context.Context, *provider.Session) error { return nil }
 
 func (f *routerFakeProvider) recorded() []string {

@@ -20,6 +20,11 @@ type recordedTurn struct {
 	continued bool
 }
 
+// recordedToolResults captures one ContinueWithToolResults invocation.
+type recordedToolResults struct {
+	results []provider.ToolResult
+}
+
 // fakeProvider is a filesystem-/network-free Provider with scripted turn
 // results and recorded calls. Each turn pops the next result from results
 // (falling back to defaultResult once exhausted).
@@ -32,7 +37,8 @@ type fakeProvider struct {
 	results       []provider.TurnResult
 	defaultResult provider.TurnResult
 
-	turns []recordedTurn
+	turns       []recordedTurn
+	toolResults []recordedToolResults
 }
 
 func (f *fakeProvider) nextResult() provider.TurnResult {
@@ -71,7 +77,25 @@ func (f *fakeProvider) ContinueTurn(_ context.Context, _ *provider.Session, prom
 	return &fakeStream{result: f.nextResult()}, nil
 }
 
+func (f *fakeProvider) ContinueWithToolResults(
+	_ context.Context, _ *provider.Session, results []provider.ToolResult,
+) (provider.TurnStream, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.startErr != nil {
+		return nil, f.startErr
+	}
+	f.toolResults = append(f.toolResults, recordedToolResults{results: results})
+	return &fakeStream{result: f.nextResult()}, nil
+}
+
 func (f *fakeProvider) EndSession(context.Context, *provider.Session) error { return nil }
+
+func (f *fakeProvider) recordedToolResults() []recordedToolResults {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]recordedToolResults(nil), f.toolResults...)
+}
 
 func (f *fakeProvider) recorded() []recordedTurn {
 	f.mu.Lock()
