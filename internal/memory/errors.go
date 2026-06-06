@@ -13,3 +13,9 @@ var (
 	// layer.
 	ErrWriteFailed = errors.New("memory_write_failed")
 )
+
+// ErrInvalidEntry signals a programmer error: a write was attempted with a
+// malformed entry (unknown layer/source, missing project id). It is not a
+// SPEC §23.5 classification; the write path wraps it in ErrWriteFailed at
+// the store boundary.
+var ErrInvalidEntry = errors.New("memory: invalid entry")
