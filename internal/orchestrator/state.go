@@ -287,6 +287,22 @@ func (s *RuntimeStore) setEnforcerStatus(v EnforcerStatus) {
 	s.enforcerStatus = v
 }
 
+// SetPendingGCTasks records the count of open GC tasks the enforcer has created
+// (SPEC §4.1.11 pending_gc_tasks). The scheduled GC worker (Phase 12) calls it
+// after a GC run so RuntimeState reflects outstanding enforcement debt.
+func (s *RuntimeStore) SetPendingGCTasks(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n < 0 {
+		n = 0
+	}
+	s.pendingGCTasks = n
+}
+
+// PendingGCTasks reports the orchestrator's exported pending GC task count so
+// the enforcer can accumulate across GC runs.
+func (o *Orchestrator) SetPendingGCTasks(n int) { o.store.SetPendingGCTasks(n) }
+
 // snapshot returns a deep copy of the runtime state. Mutating the returned
 // value cannot affect the live store.
 func (s *RuntimeStore) snapshot() RuntimeState {

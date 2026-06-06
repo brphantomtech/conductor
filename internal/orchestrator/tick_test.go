@@ -64,6 +64,28 @@ func (violationsEnforcer) PreDispatch(context.Context) (EnforcerStatus, error) {
 	return EnforcerViolationsPresent, nil
 }
 
+type blockingEnforcer struct{}
+
+func (blockingEnforcer) PreDispatch(context.Context) (EnforcerStatus, error) {
+	return EnforcerBlocked, nil
+}
+
+// TestRunTick_EnforcerBlockedSkipsDispatch asserts the Phase 12 confined
+// orchestrator change: when the enforcer reports blocked, no issue is
+// dispatched that tick, while reconciliation (step 2) still runs.
+func TestRunTick_EnforcerBlockedSkipsDispatch(t *testing.T) {
+	tr := &fakeTracker{candidates: []tracker.Issue{issue("i1", "A-1", "Todo")}}
+	ws := &fakeWorkspaces{}
+	pr := &fakeProvider{}
+	o, _ := testOrchestrator(t, tr, ws, pr, WithEnforcer(blockingEnforcer{}))
+
+	o.runTick(context.Background())
+	o.Wait()
+
+	require.Equal(t, EnforcerBlocked, o.RuntimeState().EnforcerStatus)
+	require.Empty(t, ws.created, "blocking enforcer status must skip dispatch")
+}
+
 func TestRunTick_ContextCancelledNoOp(t *testing.T) {
 	tr := &fakeTracker{candidates: []tracker.Issue{issue("i1", "A-1", "Todo")}}
 	ws := &fakeWorkspaces{}

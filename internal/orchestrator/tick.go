@@ -101,7 +101,13 @@ func (o *Orchestrator) runTick(ctx context.Context) {
 
 // dispatchCandidates selects the eligible candidates in dispatch order and
 // claims each until the slots chosen by selection are consumed (SPEC §13.3).
+// When the enforcer reported a blocking violation this tick (SPEC §11.2,
+// enforcer_status == blocked), dispatch is skipped entirely so no new issue is
+// claimed; reconciliation (step 2) and observability (step 9) still run.
 func (o *Orchestrator) dispatchCandidates(candidates []tracker.Issue) {
+	if o.store.snapshot().EnforcerStatus == EnforcerBlocked {
+		return
+	}
 	cfg := selectionConfigFrom(o.configFn())
 	selected := selectDispatch(candidates, o.store.snapshot(), o.clock(), cfg)
 	for _, iss := range selected {
