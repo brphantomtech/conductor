@@ -8,14 +8,16 @@ import (
 	"time"
 
 	"github.com/conductor-sh/conductor/internal/audit"
+	"github.com/conductor-sh/conductor/internal/router"
 	"github.com/conductor-sh/conductor/internal/tracker"
 	"github.com/conductor-sh/conductor/internal/workspace"
 )
 
 // dispatch claims an eligible issue and launches a worker goroutine that runs
-// the single hardcoded coder turn (SPEC §13 / §14.3). It returns true when a
-// worker was launched. A failed claim (the issue is already claimed or
-// running) returns false without side effects.
+// the router-selected pipeline (SPEC §12 / §13 / §14.3). When no router is
+// wired it runs the single hardcoded coder turn (Phase 6 behavior). It returns
+// true when a worker was launched. A failed claim (the issue is already claimed
+// or running) returns false without side effects.
 func (o *Orchestrator) dispatch(iss tracker.Issue) bool {
 	if !o.store.claim(iss.ID) {
 		return false
@@ -26,7 +28,7 @@ func (o *Orchestrator) dispatch(iss tracker.Issue) bool {
 		IssueID:    iss.ID,
 		Identifier: iss.Identifier,
 		State:      iss.State,
-		Pipeline:   []string{coderRole},
+		Pipeline:   o.selectPipeline(iss),
 		Attempt:    o.nextAttemptNumber(iss.ID),
 		StartedAt:  o.clock().UTC(),
 	}
@@ -66,16 +68,40 @@ func (o *Orchestrator) runWorker(iss tracker.Issue, attempt *RunAttempt) {
 
 	o.store.markRunning(attempt)
 	o.emit(ctx, audit.EventRunAttemptStarted, attempt, map[string]any{
-		"attempt": attempt.Attempt,
-		"role":    coderRole,
+		"attempt":  attempt.Attempt,
+		"role":     firstRole(attempt.Pipeline),
+		"pipeline": attempt.Pipeline,
 	})
 
 	outcome, reason := o.runTurn(ctx, iss, attempt)
 	o.finishAttempt(attempt, outcome, reason)
 }
 
-// runTurn renders the coder prompt and runs a single provider turn, mapping
-// the result to a run outcome and a SPEC §23.4 sentinel string. Workspace
+// selectPipeline returns the issue's pipeline. When the Agent Router is wired
+// (Phase 7) it selects from routing.rules / routing.pipeline; otherwise it
+// falls back to the Phase 6 single hardcoded coder pipeline.
+func (o *Orchestrator) selectPipeline(iss tracker.Issue) []string {
+	if o.router != nil {
+		if p := o.router.SelectPipeline(iss); len(p) > 0 {
+			return p
+		}
+	}
+	return []string{coderRole}
+}
+
+// firstRole returns the first role of a pipeline, or the coder role when the
+// pipeline is empty.
+func firstRole(pipeline []string) string {
+	if len(pipeline) > 0 {
+		return pipeline[0]
+	}
+	return coderRole
+}
+
+// runTurn creates the workspace and then executes the attempt's pipeline,
+// mapping the result to a run outcome and a SPEC §23.4 sentinel string. When
+// the Agent Router is wired (Phase 7) it drives the full role pipeline through
+// RunPipeline; otherwise it runs the Phase 6 single coder turn. Workspace
 // creation, render, and turn failures are each classified distinctly.
 func (o *Orchestrator) runTurn(ctx context.Context, iss tracker.Issue, attempt *RunAttempt) (Outcome, string) {
 	// Workspace creation (SPEC §14). after_create hook failures surface as
@@ -89,16 +115,53 @@ func (o *Orchestrator) runTurn(ctx context.Context, iss tracker.Issue, attempt *
 		return OutcomeFailed, ErrWorkspaceCreationFailed.Error()
 	}
 
-	// Render the coder prompt (SPEC §16.2). A render failure is fatal to the
-	// attempt and maps to prompt_render_failed.
+	if o.router != nil {
+		return o.runPipeline(ctx, iss, attempt, ws.Path)
+	}
+	return o.runSingleCoderTurn(ctx, iss, attempt, ws.Path)
+}
+
+// runPipeline drives the router-selected pipeline (SPEC §12.4). The router
+// renders each role's prompt, runs the turns, and hands output between roles;
+// the orchestrator classifies any returned error into its SPEC §23.4 outcome
+// (so reconciliation/stall cancellation is honored exactly as in Phase 6).
+func (o *Orchestrator) runPipeline(
+	ctx context.Context, iss tracker.Issue, attempt *RunAttempt, workspacePath string,
+) (Outcome, string) {
+	rc := router.RunContext{
+		Issue:         iss,
+		AttemptID:     attempt.ID,
+		Attempt:       attempt.Attempt,
+		WorkspacePath: workspacePath,
+		Pipeline:      attempt.Pipeline,
+		AdvanceIndex:  func(i int) { attempt.PipelineIndex = i },
+	}
+	if _, err := o.router.RunPipeline(ctx, rc); err != nil {
+		if errors.Is(err, router.ErrPromptRenderFailed) {
+			o.log.Warn().Err(err).Str("issue", iss.Identifier).Msg("pipeline prompt render failed")
+			return OutcomeFailed, ErrPromptRenderFailed.Error()
+		}
+		if errors.Is(err, router.ErrValidationPipelineFailed) {
+			return OutcomeFailed, ErrValidationPipelineFailed.Error()
+		}
+		return o.classifyTurnError(ctx, iss, err)
+	}
+	return OutcomeSucceeded, ""
+}
+
+// runSingleCoderTurn renders the coder prompt and runs a single provider turn —
+// the Phase 6 dispatch path, retained for when no router is wired. A render
+// failure is fatal and maps to prompt_render_failed.
+func (o *Orchestrator) runSingleCoderTurn(
+	ctx context.Context, iss tracker.Issue, attempt *RunAttempt, workspacePath string,
+) (Outcome, string) {
 	prompt, err := o.renderPrompt(iss, attempt)
 	if err != nil {
 		o.log.Warn().Err(err).Str("issue", iss.Identifier).Msg("coder prompt render failed")
 		return OutcomeFailed, ErrPromptRenderFailed.Error()
 	}
 
-	// Run a single provider turn against the session.
-	sess, err := o.provider.CreateSession(ctx, o.providerCfg, ws.Path)
+	sess, err := o.provider.CreateSession(ctx, o.providerCfg, workspacePath)
 	if err != nil {
 		return o.classifyTurnError(ctx, iss, err)
 	}

@@ -83,6 +83,11 @@ type Orchestrator struct {
 	classifier Classifier
 	memoryPost MemoryPostProcessor
 
+	// router is the Phase 7 Agent Router (SPEC §12). When nil, dispatch uses
+	// the Phase 6 single-coder turn path. When wired, dispatch selects the
+	// pipeline and drives RunPipeline through it.
+	router PipelineRouter
+
 	store *RuntimeStore
 
 	// runCtx is the long-lived base context worker goroutines derive from so
@@ -216,6 +221,16 @@ func WithClassifier(c Classifier) Option {
 	return func(o *Orchestrator) {
 		if c != nil {
 			o.classifier = c
+		}
+	}
+}
+
+// WithPipelineRouter wires the Phase 7 Agent Router so dispatch selects the
+// pipeline and drives RunPipeline through it (SPEC §12).
+func WithPipelineRouter(r PipelineRouter) Option {
+	return func(o *Orchestrator) {
+		if r != nil {
+			o.router = r
 		}
 	}
 }

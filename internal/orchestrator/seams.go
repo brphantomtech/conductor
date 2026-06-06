@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 
+	"github.com/conductor-sh/conductor/internal/router"
 	"github.com/conductor-sh/conductor/internal/tracker"
 )
 
@@ -36,6 +37,16 @@ type DocStoreSync interface {
 // candidates unchanged, which is correct for Phase 6's single coder pipeline.
 type Classifier interface {
 	Classify(ctx context.Context, candidates []tracker.Issue) ([]tracker.Issue, error)
+}
+
+// PipelineRouter is the Phase 7 Agent Router seam (SPEC §12.3/§12.4). When
+// wired, dispatch asks it for the issue's pipeline (SelectPipeline) and drives
+// the role loop through it (RunPipeline). When no router is wired (Phase 6
+// default), dispatch falls back to the single hardcoded coder turn so the
+// earlier behavior is reproduced exactly.
+type PipelineRouter interface {
+	SelectPipeline(iss tracker.Issue) []string
+	RunPipeline(ctx context.Context, rc router.RunContext) (string, error)
 }
 
 // MemoryPostProcessor is reconciliation Part C (SPEC §13.5): writing a
