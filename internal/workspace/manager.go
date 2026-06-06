@@ -180,6 +180,31 @@ func (m *Manager) AgentCommand(ctx context.Context, ws *Workspace, name string, 
 	return cmd, nil
 }
 
+// Resolve returns the Workspace handle for an issue without touching the
+// filesystem. It computes the confined path (SPEC §14.2) and the .conductor/
+// layout fields so callers that already know a workspace exists — the
+// orchestrator's startup terminal cleanup (SPEC §13.6) — can Remove it without
+// first re-creating its skeleton or running hooks. The returned handle carries
+// no repo layout (Resolve does not inspect the directory contents).
+func (m *Manager) Resolve(issueID, issueIdentifier string) (*Workspace, error) {
+	path, err := m.resolvePath(issueIdentifier)
+	if err != nil {
+		return nil, err
+	}
+	conductor := filepath.Join(path, ".conductor")
+	return &Workspace{
+		Key:             SanitizeKey(issueIdentifier),
+		Path:            path,
+		Root:            m.absRoot(),
+		IssueID:         issueID,
+		IssueIdentifier: issueIdentifier,
+		ConductorDir:    conductor,
+		AuditLogPath:    filepath.Join(conductor, "audit.jsonl"),
+		ValidationDir:   filepath.Join(conductor, "validation"),
+		MetaPath:        filepath.Join(conductor, "meta.json"),
+	}, nil
+}
+
 // resolvePath sanitizes the identifier, joins it under the configured root,
 // and verifies the result stays inside the root (SPEC §14.2 Invariants 2+3).
 func (m *Manager) resolvePath(identifier string) (string, error) {

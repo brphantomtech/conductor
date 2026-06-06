@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -11,6 +12,10 @@ import (
 	"github.com/conductor-sh/conductor/internal/config"
 	"github.com/conductor-sh/conductor/internal/db"
 	"github.com/conductor-sh/conductor/internal/harness"
+	"github.com/conductor-sh/conductor/internal/orchestrator"
+	"github.com/conductor-sh/conductor/internal/provider"
+	"github.com/conductor-sh/conductor/internal/tracker"
+	"github.com/conductor-sh/conductor/internal/workspace"
 )
 
 // startFlags captures the SPEC §19.2 surface of `conductor start`. Phase 2
@@ -168,8 +173,65 @@ func runStart(ctx context.Context, cmd *cobra.Command, rctx *rootContext, flags 
 		}()
 	}
 
-	rctx.log.Info().Msg("orchestrator not yet implemented (Phase 6) — exiting cleanly")
+	// Construct and run the orchestrator (SPEC §13). It owns the poll loop
+	// until the context is cancelled (SIGINT/SIGTERM, wired by the root cmd).
+	return runOrchestrator(ctx, rctx, cfg, res.Definition, writer)
+}
+
+// runOrchestrator wires the Phase-6 collaborators and runs the poll loop until
+// ctx is cancelled. A clean context cancellation (graceful shutdown) is not an
+// error.
+func runOrchestrator(
+	ctx context.Context, rctx *rootContext, cfg config.Config,
+	def *harness.Definition, writer *audit.Writer,
+) error {
+	trackerAdapter, err := tracker.New(cfg.Tracker, tracker.WithLogger(rctx.log))
+	if err != nil {
+		return fmt.Errorf("start: construct tracker: %w", err)
+	}
+
+	coderCfg := resolveProviderConfig(cfg, "coder")
+	providerAdapter, err := provider.New(coderCfg, provider.WithLogger(rctx.log))
+	if err != nil {
+		return fmt.Errorf("start: construct provider: %w", err)
+	}
+
+	wsManager := workspace.New(cfg.Workspace, cfg.Hooks,
+		workspace.WithLogger(rctx.log),
+		workspace.WithAudit(writer),
+		workspace.WithProjectID(cfg.Project.ID),
+	)
+
+	templates := map[string]string{}
+	if def != nil {
+		templates = def.PromptTemplates
+	}
+
+	o := orchestrator.New(
+		orchestrator.WithTracker(trackerAdapter),
+		orchestrator.WithWorkspaces(wsManager),
+		orchestrator.WithProvider(providerAdapter, coderCfg),
+		orchestrator.WithAudit(writer),
+		orchestrator.WithConfig(func() config.Config { return cfg }),
+		orchestrator.WithTemplates(func() map[string]string { return templates }),
+		orchestrator.WithLogger(rctx.log),
+	)
+
+	rctx.log.Info().Msg("orchestrator started")
+	if err := o.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("start: orchestrator: %w", err)
+	}
+	rctx.log.Info().Msg("orchestrator stopped")
 	return nil
+}
+
+// resolveProviderConfig returns the provider config for a role, falling back
+// to the default provider when the role has no override (SPEC §5.3.6).
+func resolveProviderConfig(cfg config.Config, role string) config.ProviderConfig {
+	if rc, ok := cfg.Providers.Roles[role]; ok && rc.Provider != "" {
+		return rc
+	}
+	return cfg.Providers.Default
 }
 
 func sortedTemplateRoles(def *harness.Definition) []string {
