@@ -41,6 +41,7 @@ Frontend (SvelteKit, embedded into Go binary via `embed`):
 - Phase 1 + Phase 2 atomic task list → [TASKS.md](TASKS.md)
 - Phase 2 HARNESS.md loader (parser, validator, renderer, watcher) → [internal/harness/](internal/harness/)
 - Phase 6 orchestrator core (poll loop, runtime state, run-attempt lifecycle, candidate selection, retry/backoff, reconciliation, startup cleanup, single coder dispatch) → [internal/orchestrator/](internal/orchestrator/)
+- Phase 8 validation pipeline (per-turn shell-check runner with timeout/classification, atomic per-turn JSON persistence, fail_on_severity decision, context formatter, `conductor validation run`) → [internal/validation/](internal/validation/)
 - Phase 10 Knowledge Engine (seven-stage indexing pipeline, KnowledgeNode/KnowledgeEdge model, sqlite_vec store with qdrant behind a build tag, incremental fsnotify re-index, hybrid search, `## Codebase Context` formatter, layer-violation detection, `conductor knowledge` CLI) → [internal/knowledge/](internal/knowledge/)
 
 This file is a map. It contains no rules. Rules and rationale live in `docs/`.

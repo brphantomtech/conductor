@@ -17,6 +17,7 @@ import (
 	"github.com/conductor-sh/conductor/internal/orchestrator"
 	"github.com/conductor-sh/conductor/internal/provider"
 	"github.com/conductor-sh/conductor/internal/tracker"
+	"github.com/conductor-sh/conductor/internal/validation"
 	"github.com/conductor-sh/conductor/internal/workspace"
 )
 
@@ -203,6 +204,24 @@ func runOrchestrator(
 		workspace.WithAudit(writer),
 		workspace.WithProjectID(cfg.Project.ID),
 	)
+
+	// Construct the Validation Pipeline (SPEC §15) so it is available to the
+	// turn loop. The live per-turn invocation point is owned by the Phase 7
+	// router (SPEC §12.4 step 5), which builds a workspace-scoped command
+	// factory per issue via validation.NewWorkspaceCommandFactory and calls
+	// Pipeline.Run; this phase constructs the shared, stateless pipeline.
+	validationPipeline := validation.New(cfg.Validation,
+		validation.WithLogger(rctx.log),
+		validation.WithAudit(writer),
+		validation.WithProjectID(cfg.Project.ID),
+	)
+	rctx.log.Info().
+		Bool("validation_enabled", cfg.Validation.Enabled).
+		Int("validation_checks", len(cfg.Validation.Checks)).
+		Msg("validation pipeline ready")
+	// validationPipeline is handed to the router turn loop in Phase 7; retained
+	// here as the constructed, shared instance.
+	_ = validationPipeline
 
 	templates := map[string]string{}
 	if def != nil {
