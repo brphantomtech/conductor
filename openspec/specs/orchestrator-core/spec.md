@@ -8,9 +8,7 @@ Attempt, and runs a poll loop that reconciles active runs, selects and sorts dis
 candidates, dispatches eligible issues within concurrency limits, and schedules retries
 with backoff. For Phase 6 it executes a single hardcoded `coder` dispatch path, classifies
 failures using the SPEC §23.4 sentinels, and is wired into `conductor start`.
-
 ## Requirements
-
 ### Requirement: Orchestrator Runtime State
 
 The orchestrator SHALL own a single authoritative in-memory runtime state (SPEC §4.1.11)
@@ -47,15 +45,16 @@ agent roles), `pipeline_index`, attempt number, start time, terminal outcome, an
 `validation_results` slot. A `RunAttemptStarted` audit event SHALL be written when an
 attempt begins and a `RunAttemptEnded` event when it terminates, regardless of outcome.
 
-For Phase 6 the `pipeline` SHALL be the single hardcoded `[coder]` and `pipeline_index`
-SHALL remain `0`.
+The `pipeline` SHALL be the pipeline selected by the Agent Router for the issue, and
+`pipeline_index` SHALL advance as each role executes. When routing produces a single-role
+pipeline, the attempt behaves as the earlier single-`coder` path did.
 
 #### Scenario: Attempt records start and end
 
-- **WHEN** an issue is dispatched and its turn completes
-- **THEN** the run attempt has a non-empty ID, `pipeline == [coder]`, and exactly one
-  `RunAttemptStarted` and one `RunAttemptEnded` audit event are written with the end event
-  recording the outcome
+- **WHEN** an issue is dispatched and its pipeline completes
+- **THEN** the run attempt has a non-empty ID, a `pipeline` equal to the router-selected roles, and
+  exactly one `RunAttemptStarted` and one `RunAttemptEnded` audit event are written with the end
+  event recording the outcome
 
 #### Scenario: Failed attempt still ends cleanly
 
@@ -193,19 +192,26 @@ startup.
 
 ### Requirement: Single Coder Dispatch Path
 
-Dispatch SHALL execute a single hardcoded `coder` role for Phase 6 (no routing,
-classification, or multi-role pipelines). Dispatching an issue SHALL: claim the issue,
-write an `IssueDispatched` audit event, create or reuse the issue workspace via
-`internal/workspace`, render the `coder` prompt template via `internal/harness`, start a
-provider turn via `internal/provider`, record the run-attempt lifecycle, and on terminal
-state release the claim with an `IssueReleased` audit event.
+Dispatch SHALL execute the pipeline selected by the Agent Router (replacing the Phase 6 hardcoded
+single `coder` role). Dispatching an issue SHALL: claim the issue, write an `IssueDispatched` audit
+event, create or reuse the issue workspace via `internal/workspace`, classify the issue when needed
+and select its pipeline via the router, render each role's prompt template via `internal/harness`,
+execute each role's turn via `internal/provider` in pipeline order, record the run-attempt lifecycle,
+and on terminal state release the claim with an `IssueReleased` audit event. Issue classification
+SHALL be wired through the orchestrator's existing classification seam.
 
-#### Scenario: End-to-end single dispatch
+#### Scenario: End-to-end router-driven dispatch
 
 - **WHEN** an eligible issue is dispatched
-- **THEN** a workspace is created, the `coder` prompt is rendered, a provider turn is
-  started, and on completion the claim is released with `IssueDispatched` and
-  `IssueReleased` audit events recorded
+- **THEN** a workspace is created, the issue's pipeline is selected by the router, each role's prompt
+  is rendered and its turn executed in order, and on completion the claim is released with
+  `IssueDispatched` and `IssueReleased` audit events recorded
+
+#### Scenario: Single-role pipeline matches prior behavior
+
+- **WHEN** routing selects a single-role `[coder]` pipeline
+- **THEN** dispatch renders and runs exactly one `coder` turn, equivalent to the Phase 6 dispatch
+  path
 
 #### Scenario: Workspace creation failure is classified
 
@@ -245,3 +251,4 @@ issue.
 - **WHEN** `conductor start --dry-run` is invoked
 - **THEN** config loads, the orchestrator is not started into its dispatch loop, and the
   process exits cleanly without creating a workspace
+
